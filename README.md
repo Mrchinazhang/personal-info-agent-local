@@ -167,10 +167,10 @@ Google OAuth 已 retired，OpenAI / ChatGPT / TikTok / GitHub 从未提供；
 
 ## 七、测试
 
-零第三方测试框架，两套共 54 项：
+零第三方测试框架，两套共 67 项：
 
 ```bash
-# 后端：数据库 CRUD / 安全 / 规则引擎（32 项，临时库，不碰真实数据）
+# 后端：数据库 CRUD / 安全 / 规则引擎 + 同步脚本（45 项，临时库，不碰真实数据）
 python -m unittest discover -s tests -p "test_*.py" -v
 
 # 前端：脚本顺序、去 CDN、app.js 字节级一致、兼容层请求形状（22 项）
@@ -180,6 +180,25 @@ node tests/local.test.js
 后端测试把 Ollama 指向 `127.0.0.1:1`，**真实覆盖「没装 Ollama」这条路径**，
 不发任何外网请求。`tests/local.test.js` 在 vm 沙箱里用假 `fetch` 验证
 `auth` / `database` / `llm` 三大模块发给 `/api` 的请求形状。
+`tests/test_sync.py` 用临时目录验证一键同步脚本的白名单边界、dry-run 与推送顺序，
+同样不触碰真实的运行版目录。
+
+### 维护者：从运行版一键同步
+
+日常真正跑 Flask 服务的目录和本仓库是两个独立目录。改完运行版的代码后，
+双击本目录的 **`sync.bat`**（或运行 `python sync.py`）即可自动复制变更、提交并推送：
+
+```bash
+python sync.py --dry-run       # 只预览会同步哪些文件，不写入、不提交
+python sync.py --no-push       # 只提交，不推送
+python sync.py -m "fix: ..."   # 自定义提交信息
+python sync.py --src D:/path/to/local   # 运行版换了位置时手动指定
+```
+
+脚本只按白名单复制 **15 个代码文件**：**不会覆盖仓库版 `README.md`**（含仓库地址、
+CI 徽章、clone 步骤），不会删除 `.github/`、`CONTRIBUTING.md`、`SECURITY.md`，
+也绝不会把 `data/pia.db`、`__pycache__` 带进仓库；推送前还会校验 `origin` 是预期仓库。
+若运行版的说明文档有更新，请手动合并到仓库版 README。
 
 ---
 
@@ -198,8 +217,11 @@ personal-info-agent-local/
 ├── requirements.txt    唯一依赖：Flask
 ├── start.bat           Windows 双击启动
 ├── start.sh            macOS / Linux 启动
+├── sync.py             一键同步：运行版 → 本仓库
+├── sync.bat            Windows 双击同步
 ├── tests/
 │   ├── test_server.py  后端 32 项
+│   ├── test_sync.py    同步脚本 13 项
 │   └── local.test.js   前端契约 22 项
 ├── .github/
 │   ├── workflows/ci.yml  Python 3.10–3.13 单测 + 前端契约 + 凭证扫描

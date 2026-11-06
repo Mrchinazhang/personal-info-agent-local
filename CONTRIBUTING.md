@@ -13,10 +13,17 @@ python server.py
 
 打开 <http://127.0.0.1:8771/>。需要 Python 3.10+；Node 只在跑前端契约测试时才需要。
 
+## 从运行版同步代码
+
+维护者本机另有一个「运行版」目录（真正跑服务、存放 `data/pia.db`）。改完那边之后，
+双击本目录的 `sync.bat` 或运行 `python sync.py` 即可按白名单同步 15 个代码文件并自动
+提交推送；`python sync.py --dry-run` 可先预览。脚本**不会**覆盖本仓库的 `README.md`
+和 `.github/` 等专属文件，也不会把个人数据库带进来。详见 README「维护者：从运行版一键同步」。
+
 ## 提交前自查
 
 ```bash
-# 后端 32 项
+# 后端 32 项 + 同步脚本 13 项
 python -m unittest discover -s tests -p "test_*.py" -v
 
 # 前端契约 22 项
