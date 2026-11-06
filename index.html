@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>个人信息管家 Agent</title>
+  <link rel="stylesheet" href="styles.css?v=20261106e" />
+  <!-- 本地离线版：不加载任何云端 SDK / CDN，所有能力由本机 Flask 提供 -->
+</head>
+<body>
+
+  <!-- ============ 登录 ============ -->
+  <section id="auth-view" class="auth-wrap hidden" data-i18n-static>
+    <div class="auth-card">
+      <button id="lang-toggle" type="button" class="lang-toggle" data-i18n-skip aria-label="Switch to English">EN</button>
+      <div class="auth-brand">
+        <div class="auth-logo">🧠</div>
+        <h1>个人信息管家</h1>
+        <p>记下零散的想法、资料与待办，让 AI 自动分类、总结、关联</p>
+      </div>
+
+      <div class="auth-form">
+        <div class="auth-tabs" role="tablist" aria-label="选择验证码登录方式">
+          <button type="button" class="auth-tab is-active" data-method="phone" role="tab" aria-selected="true">📱 手机号</button>
+          <button type="button" class="auth-tab" data-method="email" role="tab" aria-selected="false">✉️ 邮箱</button>
+        </div>
+
+        <div id="pane-phone" class="auth-pane">
+          <label for="phone-input">手机号</label>
+          <input id="phone-input" type="tel" inputmode="tel" maxlength="24" placeholder="13800138000 或 +1 4155550123" autocomplete="tel" />
+          <p class="field-hint">中国大陆填 11 位号码；海外号码请以 + 区号开头（不要给大陆号加 +86）</p>
+          <p id="phone-error" class="field-error"></p>
+        </div>
+
+        <div id="pane-email" class="auth-pane hidden">
+          <label for="email-input">邮箱</label>
+          <input id="email-input" type="email" inputmode="email" maxlength="120" placeholder="you@gmail.com" autocomplete="email" />
+          <p class="field-hint">Gmail / Outlook 等海外邮箱均可，不需要海外手机号</p>
+          <p id="email-error" class="field-error"></p>
+        </div>
+
+        <label for="code-input">验证码</label>
+        <div class="code-row">
+          <input id="code-input" type="text" inputmode="numeric" maxlength="8" placeholder="收到的验证码" autocomplete="one-time-code" />
+          <button id="send-code-btn" type="button" class="btn-ghost">获取验证码</button>
+        </div>
+
+        <button id="login-btn" type="button" class="btn-primary">登录 / 注册</button>
+
+        <div class="divider"><span>或使用其他账号</span></div>
+        <button id="wechat-btn" type="button" class="btn-oauth btn-wechat">💬 微信登录</button>
+        <button id="workbuddy-btn" type="button" class="btn-oauth btn-workbuddy">🅦 使用 WorkBuddy 登录</button>
+
+        <p class="intl-note lang-zh" data-i18n-skip>国际用户请用上方「✉️ 邮箱」验证码登录（Gmail / Outlook 均可，不需要手机号）。本平台不提供 Google / ChatGPT / GitHub 等第三方账号登录。</p>
+        <p class="intl-note lang-en" data-i18n-skip>Sign in with the <strong>Email</strong> tab above — Gmail / Outlook work, no phone number needed. This platform does not offer Google, ChatGPT or GitHub sign-in.</p>
+
+        <p id="auth-error" class="form-error"></p>
+
+        <div class="auth-notice">
+          <strong>⚠️ 请固定使用同一种登录方式</strong>
+          <p>手机号、邮箱、微信、WorkBuddy 账号在云端是<strong>彼此独立的账号</strong>，数据不互通。换一种方式登录会看到空资料库——这不是数据丢失，换回原来的方式即可；平台目前不支持账号合并。</p>
+        </div>
+
+        <p class="auth-tip">未注册的手机号 / 邮箱将自动创建账号，无需设置密码。</p>
+        <p class="auth-privacy">手机号与邮箱仅用于接收登录验证码，不作其他用途；你记录的内容保存在云端数据库，按账号隔离，仅你本人可见。需要注销账号或删除全部数据，请联系作者。</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 应用主体 ============ -->
+  <section id="app-view" class="hidden">
+    <header class="topbar" data-i18n-static>
+      <div class="brand"><span class="brand-icon">🧠</span> 个人信息管家</div>
+      <div class="topbar-right">
+        <label class="model-picker">
+          模型
+          <select id="model-select" title="选择用于整理与问答的大模型"></select>
+        </label>
+        <div class="user-chip" id="user-chip"></div>
+        <button id="logout-btn" type="button" class="btn-ghost-sm">退出</button>
+        <button id="lang-toggle-app" type="button" class="lang-toggle" data-i18n-skip aria-label="Switch to English">EN</button>
+      </div>
+    </header>
+
+    <div class="shell">
+      <nav class="sidebar" id="sidebar" data-i18n-static>
+        <button type="button" data-view="capture" class="nav-btn">✍️ 快速记录</button>
+        <button type="button" data-view="import" class="nav-btn">📥 内容导入</button>
+        <button type="button" data-view="library" class="nav-btn">📚 我的资料库</button>
+        <button type="button" data-view="todos" class="nav-btn">✅ 待办整理</button>
+        <button type="button" data-view="ask" class="nav-btn">💬 智能问答</button>
+        <button type="button" data-view="reports" class="nav-btn">📊 阶段总结</button>
+      </nav>
+      <main id="main" class="main"></main>
+    </div>
+  </section>
+
+  <div id="toast" class="toast hidden"></div>
+  <div id="modal" class="modal hidden"><div class="modal-card" id="modal-body"></div></div>
+
+  <script src="i18n-dict.js?v=20261106e"></script>
+  <script src="i18n.js?v=20261106e"></script>
+  <script src="config.js?v=20261106e"></script>
+  <!-- 兼容层实现与云端 SDK 同名的 WorkBuddyCloud.createWorkBuddyCloud，
+       必须在 app.js 之前加载；app.js 业务逻辑保持零改动。 -->
+  <script src="local-cloud.js?v=20261106e"></script>
+  <script src="app.js?v=20261106e"></script>
+</body>
+</html>

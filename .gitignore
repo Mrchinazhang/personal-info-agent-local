@@ -1,0 +1,17 @@
+# 个人数据：绝不入库、绝不上传
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Python 运行产物
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# 本地临时分析文件
+_smoke.db
+*.log
+.DS_Store

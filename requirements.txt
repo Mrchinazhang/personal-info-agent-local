@@ -1,0 +1,4 @@
+# 本地离线版唯一第三方依赖。其余全部是 Python 标准库。
+# 不需要数据库驱动（sqlite3 内置）、不需要 requests（urllib 内置）、
+# 不需要 Ollama SDK（HTTP 直连本机 11434）、不需要任何 AI 平台的 Key。
+Flask>=2.3,<4

@@ -1,0 +1,72 @@
+name: local-offline-check
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Python 3.9 已 EOL；ubuntu-latest 的 setup-python 无法再为它准备环境
+        python-version: ['3.10', '3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 后端单测（32 项，临时库，不发任何外网请求）
+        run: python -m unittest discover -s tests -p "test_*.py" -v
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: JS 语法检查
+        run: |
+          node --check app.js
+          node --check i18n.js
+          node --check i18n-dict.js
+          node --check config.js
+          node --check local-cloud.js
+          node --check tests/local.test.js
+
+      - name: 前端契约测试（22 项；无同级云端版目录时自动跳过 1 项内容比对）
+        run: node tests/local.test.js
+
+  hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 个人笔记数据与运行产物未入库
+        run: |
+          if git ls-files | grep -Eqi '(^|/)data/|\.db$|\.db-wal$|\.db-shm$|\.pyc$|__pycache__'; then
+            echo "::error::个人笔记数据或运行产物不应提交到公开仓库"
+            exit 1
+          fi
+          echo "OK: 无个人数据"
+
+      - name: 无硬编码凭证
+        # 排除工作流与测试自身：里面的正则字符串就是匹配样本
+        run: |
+          if git grep -I -n -E '(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|wbpk_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9]{20,}|BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY)' -- . ':(exclude).github/workflows/*' ':(exclude)tests/local.test.js'; then
+            echo "::error::检测到疑似凭证，请立即撤销并清理历史"
+            exit 1
+          fi
+          echo "OK: 未发现凭证"
