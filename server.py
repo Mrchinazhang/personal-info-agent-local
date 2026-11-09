@@ -3,8 +3,8 @@
 """
 个人信息管家 · 本地离线版服务端
 ==================================================================
-零费用、零云资源、零第三方 API Key。前端 app.js 与云端版字节级一致，
-靠 local-cloud.js 把 SDK 调用转到这里的同源 /api。
+零费用、零云资源、零第三方 API Key。本地版前端（app.js）自阶段 2 起独立
+演进，云端版仅作上游参考；靠 local-cloud.js 把 SDK 调用转到这里的同源 /api。
 
     Flask  ->  静态页面 + /api/*
     SQLite ->  items / item_links / chats / reports
@@ -28,6 +28,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sqlite3
 import sys
 import threading
@@ -99,6 +100,8 @@ TABLES = {
         "tags": "JSON", "summary": "TEXT", "key_points": "JSON",
         "is_todo": "BOOL", "todo_done": "BOOL", "due_date": "TEXT",
         "priority": "TEXT", "created_at": "TEXT", "updated_at": "TEXT",
+        # —— 阶段 2-A：来源与可信度 ——
+        "source_id": "INTEGER", "state": "TEXT", "confidence": "REAL",
     },
     "item_links": {
         "id": "INTEGER", "source_id": "INTEGER", "target_id": "INTEGER",
@@ -113,7 +116,16 @@ TABLES = {
         "summary": "TEXT", "highlights": "JSON", "actions": "JSON",
         "item_count": "INTEGER", "created_at": "TEXT",
     },
+    # —— 阶段 2-A：信息来源登记（provenance） ——
+    # kind: user_input(用户明确输入) / ai_extract(AI 从聊天/文本提取,待确认)
+    #       / file_import(从文件读取) / legacy(迁移前手动录入的种子行)
+    "sources": {
+        "id": "INTEGER", "kind": "TEXT", "title": "TEXT", "ref": "TEXT",
+        "meta": "JSON", "created_at": "TEXT",
+    },
 }
+
+VALID_ITEM_STATES = ("draft", "confirmed", "archived")
 
 JSON_ARRAY_COLUMNS = {"tags", "key_points", "refs", "highlights", "actions"}
 
@@ -206,9 +218,155 @@ def db_conn():
         conn.close()
 
 
-def init_db() -> None:
+# ---------------------------------------------------------------- 版本化迁移
+# 设计约束（来自 Phase 2 决策）：
+#   * 数据模型只向前演化，每次演化带版本号、可备份、可回滚；
+#   * 不得破坏现有用户数据；升级失败必须能恢复到升级前状态；
+#   * 全新库与老库升级后，最终 schema 必须完全一致（见测试断言）。
+#
+# 因此 SCHEMA 只保留「基线四表」，所有演化（sources 表、items 新列）只写在
+# MIGRATIONS 里。init_db() 先建基线再跑迁移 —— 新库和老库走同一条路径，天然等价。
+SCHEMA_VERSION = 1
+
+# 每条迁移：(version, name, fn)。fn(conn) 在调用方的事务内执行，只需做 DDL/种子。
+MIGRATIONS: list[tuple[int, str, "callable"]] = []
+
+
+def migration_v1(conn: sqlite3.Connection) -> None:
+    """阶段 2-A：引入 sources 表 + items 的 source_id/state/confidence。"""
+    # 测试可注入失败，验证「升级失败 → 回滚 + 恢复备份」路径
+    if int(os.environ.get("PIA_MIGRATION_FAIL_AT", "0")) == 1:
+        raise RuntimeError("injected migration failure (PIA_MIGRATION_FAIL_AT=1)")
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sources (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          kind TEXT NOT NULL DEFAULT 'user_input',
+          title TEXT NOT NULL DEFAULT '',
+          ref TEXT NOT NULL DEFAULT '',
+          meta TEXT NOT NULL DEFAULT '{}',
+          created_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sources_kind ON sources(kind)")
+
+    # 种子「迁移前手动录入」来源；INSERT OR IGNORE 保证幂等
+    conn.execute(
+        "INSERT OR IGNORE INTO sources (id, kind, title, ref, meta, created_at) "
+        "VALUES (1, 'legacy', '迁移前手动录入', '', '{}', ?)", (now_iso(),)
+    )
+
+    # 给 items 加列（SQLite 不支持 IF NOT EXISTS 加列，逐个判存在）
+    existing = {r[1] for r in conn.execute("PRAGMA table_info(items)").fetchall()}
+    alters = [
+        ("source_id", "ALTER TABLE items ADD COLUMN source_id INTEGER"),
+        ("state", "ALTER TABLE items ADD COLUMN state TEXT NOT NULL DEFAULT 'confirmed'"),
+        ("confidence", "ALTER TABLE items ADD COLUMN confidence REAL NOT NULL DEFAULT 1.0"),
+    ]
+    for col, ddl in alters:
+        if col not in existing:
+            conn.execute(ddl)
+
+    # 旧数据都是用户手动录入 → 视为已确认、全可信（符合「用户手动维护=最高可信」）
+    conn.execute(
+        "UPDATE items SET source_id=1, state='confirmed', confidence=1.0 "
+        "WHERE source_id IS NULL"
+    )
+
+
+MIGRATIONS.append((1, "add_sources_and_item_columns", migration_v1))
+
+
+def _integrity_ok(conn: sqlite3.Connection) -> bool:
+    row = conn.execute("PRAGMA integrity_check").fetchone()
+    return row is not None and row[0] == "ok"
+
+
+def backup_db() -> "Path | None":
+    """迁移前备份整个数据库（含 -wal/-shm）。无库文件则返回 None。"""
+    p = db_path()
+    if not p.exists():
+        return None
+    backup_dir = p.parent / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    stem, suffix = p.stem, p.suffix  # "pia" + ".db"
+    dst = backup_dir / f"{stem}.bak.{ts}{suffix}"
+    shutil.copy2(p, dst)
+    for ext in ("-wal", "-shm"):
+        wp = p.with_name(p.name + ext)
+        if wp.exists():
+            shutil.copy2(wp, backup_dir / f"{stem}.bak.{ts}{suffix}{ext}")
+    _clean_old_backups(backup_dir, keep=10)
+    return dst
+
+
+def restore_db(backup_path: Path) -> None:
+    """用备份覆盖当前数据库，并清掉可能残留的 -wal/-shm。"""
+    p = db_path()
+    for ext in ("", "-wal", "-shm"):
+        f = p if ext == "" else p.with_name(p.name + ext)
+        if f.exists():
+            f.unlink()
+    shutil.copy2(backup_path, p)
+
+
+def _clean_old_backups(backup_dir: Path, keep: int = 10) -> None:
+    groups: dict[str, list[Path]] = {}
+    for f in backup_dir.glob("pia.bak.*"):
+        m = re.match(r"pia\.bak\.(\d{8}-\d{6})\.db(?:-(wal|shm))?$", f.name)
+        if not m:
+            continue
+        groups.setdefault(m.group(1), []).append(f)
+    ordered = sorted(groups, key=lambda t: groups[t][0].stat().st_mtime, reverse=True)
+    for ts in ordered[keep:]:
+        for f in groups[ts]:
+            try:
+                f.unlink()
+            except OSError:
+                pass
+
+
+def _current_version(conn: sqlite3.Connection) -> int:
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS schema_migrations "
+        "(version INTEGER PRIMARY KEY, name TEXT, applied_at TEXT)"
+    )
+    row = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
+    return row[0] or 0
+
+
+def ensure_schema() -> None:
+    """保证数据库达到 SCHEMA_VERSION：先建基线四表，再跑待执行的版本化迁移。"""
     with db_conn() as conn:
-        conn.executescript(SCHEMA)
+        conn.executescript(SCHEMA)  # 基线四表（idempotent）
+        current = _current_version(conn)
+        pending = [m for m in MIGRATIONS if m[0] > current]
+
+    if not pending:
+        return
+
+    backup_path = backup_db()  # 升级前必备份
+    try:
+        with db_conn() as conn:
+            for ver, name, fn in pending:
+                fn(conn)
+                conn.execute(
+                    "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?,?,?)",
+                    (ver, name, now_iso()),
+                )
+            if not _integrity_ok(conn):
+                raise RuntimeError("迁移后数据库完整性校验未通过")
+    except Exception:
+        # 任何失败：关连接 → 恢复备份 → 重新抛错，绝不带坏 schema 启动
+        if backup_path is not None:
+            restore_db(backup_path)
+        raise
+
+
+def init_db() -> None:
+    """兼容旧调用：等价于 ensure_schema()。"""
+    ensure_schema()
 
 
 _JSON1_CACHE = {}
@@ -364,6 +522,25 @@ def health():
 
 
 # ---------------------------------------------------------------- /api/db
+def validate_item_fields(table: str, cols: dict) -> None:
+    """写入 items 时校验来源语义字段；其它表不动。"""
+    if table != "items":
+        return
+    if "state" in cols and cols["state"] not in VALID_ITEM_STATES:
+        raise ApiError(
+            "invalid_state",
+            "state 必须是 %s 之一" % "/".join(VALID_ITEM_STATES),
+        )
+    if "confidence" in cols:
+        try:
+            v = float(cols["confidence"])
+        except (TypeError, ValueError):
+            raise ApiError("invalid_confidence", "confidence 必须是 0-1 之间的数字")
+        if not (0.0 <= v <= 1.0):
+            raise ApiError("invalid_confidence", "confidence 必须在 0-1 之间")
+        cols["confidence"] = v
+
+
 def allow_table(name):
     if name not in TABLES:
         raise ApiError("invalid_table", f"不允许访问的表：{name}")
@@ -515,7 +692,7 @@ def db_query():
                         cols.setdefault("created_at", stamp)
                     if "updated_at" in TABLES[table]:
                         cols.setdefault("updated_at", stamp)
-                    # JSON / 布尔列补默认值，decode_row 才能稳定还原
+                    # JSON / 布尔 / 实数 / 文本列补默认值，decode_row 才能稳定还原
                     for c, kind in TABLES[table].items():
                         if c in ("id", "created_at", "updated_at"):
                             continue
@@ -523,11 +700,19 @@ def db_query():
                             cols.setdefault(c, [] if c in JSON_ARRAY_COLUMNS else {})
                         elif kind == "BOOL":
                             cols.setdefault(c, False)
+                        elif kind == "REAL":
+                            cols.setdefault(c, 1.0)
                         elif kind == "INTEGER":
                             pass
                         elif c in ("title", "content", "category", "summary", "reason",
-                                   "question", "answer", "period_label"):
+                                   "question", "answer", "period_label", "ref"):
                             cols.setdefault(c, "")
+                    # 来源语义列的默认（避免落入通用文本默认导致校验失败）
+                    if table == "items" and "state" not in cols:
+                        cols["state"] = "confirmed"
+                    if table == "sources" and "kind" not in cols:
+                        cols["kind"] = "user_input"
+                    validate_item_fields(table, cols)
                     names = list(cols)
                     marks = ",".join("?" for _ in names)
                     values = [encode_value(table, c, cols[c]) for c in names]
@@ -556,6 +741,7 @@ def db_query():
                     if not isinstance(patch, dict) or not patch:
                         raise ApiError("invalid_payload", "update 需要非空对象")
                     cols = {k: v for k, v in patch.items() if k in TABLES[table] and k != "id"}
+                    validate_item_fields(table, cols)
                     if not cols:
                         raise ApiError("invalid_payload", "没有可更新的列")
                     if "updated_at" in TABLES[table] and "updated_at" not in cols:
@@ -1098,7 +1284,27 @@ def main(argv=None):
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--open-browser", action="store_true",
                         help="服务起来后自动打开浏览器（启动脚本用）")
+    parser.add_argument("--backup", action="store_true",
+                        help="仅备份数据库（含 -wal/-shm）后退出，不做迁移/启动")
+    parser.add_argument("--restore", metavar="PATH",
+                        help="从指定备份文件恢复数据库后退出，不做迁移/启动")
+    parser.add_argument("--migrate-check", action="store_true",
+                        help="仅执行/校验数据库迁移后退出，不启动服务")
     args = parser.parse_args(argv)
+
+    # 运维子命令：备份 / 恢复 / 迁移检查都独立于服务启动，且不需要 Ollama
+    if args.restore:
+        restore_db(Path(args.restore))
+        print("[恢复] 已从备份恢复：%s" % args.restore)
+        return 0
+    if args.backup:
+        bp = backup_db()
+        print("[备份] 已生成：%s" % bp)
+        return 0
+    if args.migrate_check:
+        ensure_schema()
+        print("[迁移] 数据库已是最新 schema（v%d）" % SCHEMA_VERSION)
+        return 0
 
     # 仅将明确的真值视为允许；"0"、"false"、空字符串等均保持关闭。
     allow_lan = lan_access_enabled()
