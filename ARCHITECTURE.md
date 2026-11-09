@@ -174,19 +174,21 @@ sources (1) ──< items (N)         # 主来源：每个 item 经 items.source
 item_provenance（2-C 预留，多对多）# 同一事实的多个候选值 + 来源 + 是否被采纳，冲突天然共存
 ```
 - `sources` 字段：`id, kind(user_input|ai_extract|file_import|legacy), title, ref, meta(JSON), created_at`。
-- `items` 新增列：`source_id`(INTEGER, 可空), `state`(TEXT: draft|confirmed|archived, 默认 confirmed), `confidence`(REAL 0–1, 默认 1.0)。
+- `items` 新增列：`source_id`(**INTEGER REFERENCES sources(id) ON DELETE RESTRICT**，可空，兼容旧前端), `state`(TEXT: draft|confirmed|archived, 默认 confirmed), `confidence`(REAL 0–1, 默认 1.0)。
 - **`item_provenance` 不在 2-A 建表**，仅在 2-C 实现冲突共存时引入——地基已留好（不覆盖、不丢弃候选值）。
 
 **迁移框架（核心安全机制）：**
 - `schema_migrations` 表记录已执行版本；`SCHEMA_VERSION=1`，`MIGRATIONS` 列表驱动演化。
 - `SCHEMA` 只保留**基线四表**；所有演化（sources 表、items 新列）只写在迁移里 → **全新库与老库升级后 schema 完全一致**（有测试断言等价）。
-- 启动 `ensure_schema()`：迁移前必 `backup_db()`（复制到 `data/backups/pia.bak.<时间戳>.db`，保留最近 10 个）；每步一个事务；失败则 `restore_db()` 恢复备份并重新抛错，绝不带坏 schema 启动；迁移后跑 `PRAGMA integrity_check`。
+- 启动 `ensure_schema()`：迁移前必 `backup_db()`（**改用 SQLite Online Backup API 生成一致快照**，写出 `data/backups/pia.bak.<时间戳>.db`，保留最近 10 个；不依赖当前 journal 模式，DELETE/WAL 均可）；失败则 `restore_db()` 恢复备份并重新抛错，绝不带坏 schema 启动；`restore_db()` 恢复后重新打开数据库跑 `PRAGMA integrity_check` 与 `PRAGMA foreign_key_check`；迁移后同样跑完整性校验。
 - 手动运维：`python server.py --backup` / `--restore <路径>` / `--migrate-check`。
 - 旧数据迁移：种子 `sources(id=1, kind='legacy')`，并把所有旧 `items` 回填 `source_id=1, state=confirmed, confidence=1.0`（旧数据均属用户手动录入，视为已确认、全可信）。
 
 **写时约束**：`/api/db` 对 items 的 `state`/`confidence` 做轻量校验（枚举 + 0–1 区间）；`source_id`/`state`/`confidence` 写缺省为 `NULL`/`confirmed`/`1.0`。**来源在写时的强制选择留到 2-B/2-C**（那时前端才有来源选择 UI），2-A 只建机制与列。
 
 **2-A 已改文件**：`server.py`（数据模型 + 迁移框架 + 校验 + CLI）、`tests/test_server.py`（迁移/来源测试）、`tests/local.test.js`（删字节级比对，改接口契约 + 行为测试）、本文件。
+
+**2-A 数据库安全增强（封版前补充 ✅）**：应终审要求，在推送前补强两点——① `items.source_id` 增加 `REFERENCES sources(id) ON DELETE RESTRICT` 外键（无效来源被 DB 拒绝、NULL 仍允许、删除被引用来源受限）；② 备份由 `shutil.copy2` 文件拼接改为 `sqlite3` Online Backup API（一致快照，不绑定 DELETE 日志模式），恢复新增 `integrity_check` + `foreign_key_check`。新增 `ForeignKeyTest`（5 项）与 `test_restore_db_recovers_database_from_backup`（备份→迁移→人为损坏→恢复→结构与数据核验），并修正 `SourceAndStateTest` 删除后重新种入 legacy 来源 `id=1`。
 
 ### 2-A 边界说明
 - 不在 2-A 碰 `app.js` / `local-cloud.js` 业务职责，符合「不做无必要大规模重构」。

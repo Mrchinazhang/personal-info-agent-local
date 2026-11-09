@@ -622,6 +622,101 @@ class MigrationTest(unittest.TestCase):
         remaining = sorted(bdir.glob("pia.bak.*.db"))
         self.assertEqual(len(remaining), 10, "只应保留最近 10 个备份")
 
+    def test_restore_db_recovers_database_from_backup(self):
+        # 真正独立的恢复测试：证明 restore_db() 能从「备份文件」恢复已损坏的库，
+        # 而不是靠事务回滚（回滚会保留迁移后的 sources 表，这里必须不存在）。
+        db_path = Path(self.tmp) / "restore.db"
+        build_v0_db(str(db_path), rows=3)          # 1) 旧库（无 sources / 无新列）
+        os.environ["PIA_DB"] = str(db_path)
+        backup_path = server.backup_db()            # 2) 用 Backup API 备份
+        self.assertIsNotNone(backup_path)
+        self.assertTrue(backup_path.exists())
+        server.ensure_schema()                      # 3) 成功迁移（结构改变）
+        with server.db_conn() as conn:
+            cols_after = {r[1] for r in conn.execute("PRAGMA table_info(items)").fetchall()}
+            has_sources = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='sources'").fetchone()
+        self.assertIn("source_id", cols_after)
+        self.assertIsNotNone(has_sources)
+        with open(db_path, "wb") as f:              # 4) 人为破坏当前数据库
+            f.write(b"GARBAGE-NOT-A-VALID-SQLITE-FILE")
+        server.restore_db(backup_path)              # 5) 从备份恢复
+        with server.db_conn() as conn:              # 6) 验证结构 / 数据 / 完整性 / 外键
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(items)").fetchall()}
+            sources = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='sources'").fetchone()
+            cnt = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+            titles = {r[0] for r in conn.execute("SELECT title FROM items").fetchall()}
+            integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+            fk = conn.execute("PRAGMA foreign_key_check").fetchall()
+        self.assertNotIn("source_id", cols)         # 恢复到迁移前结构
+        self.assertIsNone(sources)                  # sources 不存在 = 确为备份文件恢复
+        self.assertEqual(cnt, 3)                    # 数据未丢失
+        self.assertEqual(titles, {"旧条目0", "旧条目1", "旧条目2"})
+        self.assertEqual(integrity, "ok")           # restore_db 内部已校验，这里再确认
+        self.assertEqual(fk, [])
+
+
+class ForeignKeyTest(unittest.TestCase):
+    """阶段 2-A 安全增强：items.source_id 外键（REFERENCES sources(id) ON DELETE RESTRICT）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pia-fk-")
+        self.orig_db = os.environ.get("PIA_DB")
+        os.environ["PIA_DB"] = str(Path(self.tmp) / "fk.db")
+        server.ensure_schema()  # 建基线 + 迁移（含 source_id 外键）
+
+    def tearDown(self):
+        if self.orig_db is None:
+            os.environ.pop("PIA_DB", None)
+        else:
+            os.environ["PIA_DB"] = self.orig_db
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _insert_item(self, source_id, state="confirmed", confidence=1.0, title="t"):
+        # server.connect() 已在每个连接开启 foreign_keys=ON
+        with server.db_conn() as conn:
+            conn.execute(
+                "INSERT INTO items (title,content,category,source_id,state,confidence,created_at,updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (title, "c", "idea", source_id, state, confidence, server.now_iso(), server.now_iso()))
+
+    def test_valid_source_id_accepted(self):
+        # 1) 合法来源 ID 可以写入
+        self._insert_item(1)
+        with server.db_conn() as conn:
+            cnt = conn.execute("SELECT COUNT(*) FROM items WHERE source_id=1").fetchone()[0]
+        self.assertGreaterEqual(cnt, 1)
+
+    def test_invalid_source_id_rejected(self):
+        # 2) 不存在的来源 ID 被数据库拒绝
+        with self.assertRaises(sqlite3.IntegrityError):
+            self._insert_item(999)
+
+    def test_null_source_id_allowed(self):
+        # 3) NULL 仍然允许（兼容旧前端）
+        with server.db_conn() as conn:
+            conn.execute(
+                "INSERT INTO items (title,content,category,source_id,state,confidence,created_at,updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                ("nullsrc", "c", "idea", None, "confirmed", 1.0, server.now_iso(), server.now_iso()))
+            rid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            val = conn.execute("SELECT source_id FROM items WHERE id=?", (rid,)).fetchone()[0]
+        self.assertIsNone(val)
+
+    def test_delete_referenced_source_restricted(self):
+        # 4) 删除仍被 items 引用的来源会失败（ON DELETE RESTRICT）
+        self._insert_item(1, title="refed")
+        with server.db_conn() as conn:
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute("DELETE FROM sources WHERE id=1")
+
+    def test_foreign_key_check_clean_after_migration(self):
+        # 5) PRAGMA foreign_key_check 无异常
+        with server.db_conn() as conn:
+            violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+        self.assertEqual(violations, [])
+
 
 class SourceAndStateTest(unittest.TestCase):
     """阶段 2-A：sources 表 + items 的 source_id/state/confidence 业务校验。"""
@@ -636,6 +731,10 @@ class SourceAndStateTest(unittest.TestCase):
                 conn.execute("DELETE FROM sqlite_sequence")
             except sqlite3.Error:
                 pass
+            # 重新种入迁移期种子来源（id=1, legacy），保证引用 source_id=1 的测试可写入
+            conn.execute(
+                "INSERT OR IGNORE INTO sources (id, kind, title, ref, meta, created_at) "
+                "VALUES (1, 'legacy', '迁移前手动录入', '', '{}', ?)", (server.now_iso(),))
 
     def test_items_insert_accepts_source_state_confidence(self):
         r = post_db(self.c, db("items", "insert", payload=[{

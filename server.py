@@ -259,7 +259,10 @@ def migration_v1(conn: sqlite3.Connection) -> None:
     # 给 items 加列（SQLite 不支持 IF NOT EXISTS 加列，逐个判存在）
     existing = {r[1] for r in conn.execute("PRAGMA table_info(items)").fetchall()}
     alters = [
-        ("source_id", "ALTER TABLE items ADD COLUMN source_id INTEGER"),
+        # source_id 外键：无效来源 ID 被数据库拒绝；NULL 仍允许（兼容旧前端）；
+        # ON DELETE RESTRICT 防止来源被删后破坏信息溯源关系。
+        ("source_id", "ALTER TABLE items ADD COLUMN source_id INTEGER "
+                      "REFERENCES sources(id) ON DELETE RESTRICT"),
         ("state", "ALTER TABLE items ADD COLUMN state TEXT NOT NULL DEFAULT 'confirmed'"),
         ("confidence", "ALTER TABLE items ADD COLUMN confidence REAL NOT NULL DEFAULT 1.0"),
     ]
@@ -283,7 +286,12 @@ def _integrity_ok(conn: sqlite3.Connection) -> bool:
 
 
 def backup_db() -> "Path | None":
-    """迁移前备份整个数据库（含 -wal/-shm）。无库文件则返回 None。"""
+    """迁移前用 SQLite Online Backup API 生成一致的数据库快照。
+
+    由 SQLite 自身完成备份，可获得一致快照，不依赖当前 journal 模式
+    （DELETE/WAL 均可），也无需手动拼接 .db/-wal/-shm 文件。
+    无库文件则返回 None。
+    """
     p = db_path()
     if not p.exists():
         return None
@@ -292,23 +300,42 @@ def backup_db() -> "Path | None":
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     stem, suffix = p.stem, p.suffix  # "pia" + ".db"
     dst = backup_dir / f"{stem}.bak.{ts}{suffix}"
-    shutil.copy2(p, dst)
-    for ext in ("-wal", "-shm"):
-        wp = p.with_name(p.name + ext)
-        if wp.exists():
-            shutil.copy2(wp, backup_dir / f"{stem}.bak.{ts}{suffix}{ext}")
+    src = sqlite3.connect(str(p), timeout=15)
+    try:
+        bk = sqlite3.connect(str(dst), timeout=15)
+        try:
+            src.backup(bk)
+        finally:
+            bk.close()
+    finally:
+        src.close()
     _clean_old_backups(backup_dir, keep=10)
     return dst
 
 
 def restore_db(backup_path: Path) -> None:
-    """用备份覆盖当前数据库，并清掉可能残留的 -wal/-shm。"""
+    """用经过验证的备份覆盖当前数据库，并清掉可能残留的 -wal/-shm。
+
+    恢复后重新打开数据库，执行完整性（integrity_check）与外键关系
+    （foreign_key_check）校验，确保恢复出来的是可用、关系一致的数据库，
+    而非空壳或损坏文件。校验失败立即抛错，绝不带坏库启动。
+    """
     p = db_path()
     for ext in ("", "-wal", "-shm"):
         f = p if ext == "" else p.with_name(p.name + ext)
         if f.exists():
             f.unlink()
     shutil.copy2(backup_path, p)
+    conn = sqlite3.connect(str(p), timeout=15)
+    try:
+        integrity = conn.execute("PRAGMA integrity_check").fetchone()
+        if integrity is None or integrity[0] != "ok":
+            raise RuntimeError("恢复后的数据库完整性校验未通过: %r" % (integrity,))
+        fk = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if fk:
+            raise RuntimeError("恢复后的数据库存在外键冲突: %r" % (fk,))
+    finally:
+        conn.close()
 
 
 def _clean_old_backups(backup_dir: Path, keep: int = 10) -> None:
