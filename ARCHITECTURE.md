@@ -181,7 +181,7 @@ item_provenance（2-C 预留，多对多）# 同一事实的多个候选值 + �
 - `schema_migrations` 表记录已执行版本；`SCHEMA_VERSION=1`，`MIGRATIONS` 列表驱动演化。
 - `SCHEMA` 只保留**基线四表**；所有演化（sources 表、items 新列）只写在迁移里 → **全新库与老库升级后 schema 完全一致**（有测试断言等价）。
 - 启动 `ensure_schema()`：迁移前必 `backup_db()`。唯一 `.tmp` + SQLite Online Backup API 写一致快照 → 关闭备份连接 → 临时文件分别跑 `PRAGMA integrity_check` 与 `PRAGMA foreign_key_check`（integrity 通过不代表外键关系正确，两项必须分别执行）→ 全部通过才 `os.replace()` 原子发布为 `data/backups/pia.bak.<时间戳>.db` → 最后才清理旧备份（只保留最近 10 份**成功生成且通过校验**的正式备份）。任一步失败只清理本次临时文件，不触碰已有正式备份、也不触发清理。
-- 迁移失败则 `restore_db()`：复制成唯一临时恢复文件 → 双校验 → 原库另存为回滚副本 → `os.replace()` 原子替换 → 重新打开再校验一次。替换前失败绝不动主库；替换后复查失败自动回滚；检测到 `-wal`/`-shm` 残留直接拒绝恢复（说明仍有连接未关，强删会丢未 checkpoint 的数据）。迁移异常与恢复异常均可追踪（恢复失败作为 cause 链的附加信息）。迁移后同样跑完整性校验。
+- 迁移失败则 `restore_db()`：复制成唯一临时恢复文件 → 双校验 → 原库另存为回滚副本 → `os.replace()` 原子替换 → 重新打开再校验一次。替换前失败绝不动主库；检测到 `-wal`/`-shm` 残留直接拒绝恢复（说明仍有连接未关，强删会丢未 checkpoint 的数据）。替换后复查失败分两条路径：**原库存在**则自动回滚，回滚本身也失败时保留 `.pre-restore` 副本，并在异常中报告「可能处于不确定状态、请勿启动服务」+ 副本完整路径 + 两个异常的 `repr`（原始恢复异常为 `__cause__`）；**原库本不存在**则把未经验证的库隔离到 `.failed-restore`（隔离失败则删除兜底），绝不让无效文件占用正式主库路径。迁移异常与恢复异常均可追踪，错误报告方式统一。迁移后同样跑完整性校验。
 - 手动运维：`python server.py --backup` / `--restore <路径>` / `--migrate-check`。
 - 旧数据迁移：种子 `sources(id=1, kind='legacy')`，并把所有旧 `items` 回填 `source_id=1, state=confirmed, confidence=1.0`（旧数据均属用户手动录入，视为已确认、全可信）。
 
@@ -193,8 +193,12 @@ item_provenance（2-C 预留，多对多）# 同一事实的多个候选值 + �
 
 **2-A 安全修复（第 6 个 commit，代码级复核后补充）**：针对复核发现的 2 个阻断缺陷，补强备份与恢复的原子性——① `backup_db()` 改为「临时文件 → 双校验 → 原子发布」，异常不留残缺正式备份、不占保留名额；② `restore_db()` 改为「先验临时恢复文件 → 回滚副本 → 原子替换 → 替换后复查」，校验失败原库零改动、无半恢复状态；③ `schema_signature()` 覆盖字段属性、索引唯一性/字段顺序/索引 SQL、外键目标与删除行为，并新增「旧结构原有对象逐项保留」断言（不要求 v0 与 v1 整体相等）；④ `ensure_schema()` 恢复失败时保留原始迁移异常。新增 5 项故障安全测试，后端测试全绿。
 
+**2-A B1/B2 定点修复（第 7 个 commit，代码级复核后补充）**：复核发现两个恢复失败路径的阻断缺陷——① 自动回滚失败时 `finally` 会删除 `.pre-restore` 唯一回滚副本；② 原库不存在时替换后校验失败会把未经验证的库留在主库路径。① 引入 `keep_rollback` 标志保留副本并补全异常报告；② 引入 `had_original` 分支与 `.failed-restore` 隔离文件（含隔离/删除兜底与路径报告）。同步统一 `ensure_schema()` 的错误报告方式。新增 2 项注入测试（`test_rollback_failure_keeps_pre_restore_copy`、`test_restore_failure_without_original_db_clears_main_path`），其余测试一条未删，后端 57 项全绿。
+
 ### 2-A 边界说明
 - 不在 2-A 碰 `app.js` / `local-cloud.js` 业务职责，符合「不做无必要大规模重构」。
+- **运行约束（备份）**：`_unique_backup_name()` 的「先判断是否存在、后 `os.replace`」不是并发安全的独占命名机制，备份操作要求**单实例、无并发**执行；多进程同时备份的名额争用留作后续独立任务（复核认定为非阻断项）。
+- **后续独立任务（非本轮阻断项）**：`backup_db()` 的 `finally` 中 `tmp.unlink()` 若自身失败可能掩盖原始备份异常，需记录残留临时文件路径；`README` 关于 WAL 的描述与 `connect()` 未显式设置 `journal_mode=WAL` 的实际行为不一致，未来真正启用 WAL 前必须处理。
 - `item_links.source_type(auto|manual)` **移至 2-B**（保持 2-A 精简）。
 - 来源选择 UX、草稿态确认流、冲突解决 UI 全部属 2-B / 2-C。
 

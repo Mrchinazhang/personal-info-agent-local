@@ -361,15 +361,22 @@ def restore_db(backup_path: Path) -> None:
     前置条件：调用方已关闭所有服务连接。若检测到 -wal/-shm 残留，说明仍有
     连接未关，直接拒绝恢复而不破坏原库（强删会丢未 checkpoint 的数据）。
 
-    流程：备份 → 唯一临时恢复文件 → 双校验 → 原库另存为回滚副本 →
-    os.replace 原子替换 → 重新打开再校验一次。替换前的任何失败都不动主库；
-    替换后复查失败则自动回滚到恢复前的原库。
+    流程：唯一临时恢复文件 → 双校验 → 原库另存为回滚副本 →
+    os.replace 原子替换 → 重新打开再校验一次。替换前失败不到主库；
+    替换后复查失败时：
+      * 原库存在 → 自动回滚；回滚也失败则**保留**回滚副本，异常中报告
+        不确定状态、副本完整路径与两个异常，供人工介入；
+      * 原库不存在 → 把未经验证的库隔离到 .failed-restore（隔离失败则删除），
+        绝不让无效文件继续占用正式主库路径。
     """
     p = db_path()
     uid = uuid.uuid4().hex
     tmp = p.with_name(p.name + "." + uid + ".restore-tmp")
     rollback = p.with_name(p.name + "." + uid + ".pre-restore")
+    quarantine = p.with_name(p.name + "." + uid + ".failed-restore")
+    had_original = p.exists()
     replaced = False
+    keep_rollback = False
     try:
         shutil.copy2(backup_path, tmp)
         _validate_db_file(tmp)
@@ -379,26 +386,50 @@ def restore_db(backup_path: Path) -> None:
                     "检测到 %s 残留，拒绝恢复以避免把旧日志应用到新库；"
                     "请先完全停止服务，确认无连接后再重试（必要时先手工备份并移除残留文件）"
                     % ext)
-        if p.exists():
+        if had_original:
             shutil.copy2(p, rollback)
         os.replace(tmp, p)
         tmp = None
         replaced = True
         _validate_db_file(p)
     except Exception as exc:
-        if replaced and rollback.exists():
+        if replaced and had_original:
             try:
                 os.replace(rollback, p)
                 rollback = None
             except OSError as rerr:
+                # 回滚失败：唯一的恢复前副本必须留下，不能被 finally 删掉
+                keep_rollback = True
                 raise RuntimeError(
-                    "恢复校验失败且自动回滚失败: %s（原错误: %s）" % (rerr, exc)
+                    "恢复校验失败且自动回滚失败：当前数据库可能处于不确定状态，请勿启动服务。"
+                    "回滚异常=%r；原始恢复异常=%r；恢复前数据库副本已保留在 %s"
+                    "（文件存在：%s）。请人工确认后用该副本覆盖主库。"
+                    % (rerr, exc, rollback.resolve(), rollback.exists())
                 ) from exc
+        if replaced and not had_original:
+            # 原库本就不存在：没有回滚副本，必须把未经验证的库移出正式路径
+            try:
+                os.replace(p, quarantine)
+                outcome = ("未经验证的数据库已隔离到 %s，主库路径当前不存在"
+                           % (quarantine.resolve(),))
+            except OSError as qerr:
+                try:
+                    p.unlink(missing_ok=True)
+                    outcome = ("隔离失败(%r)，已删除未经验证的数据库，主库路径当前不存在"
+                               % (qerr,))
+                except OSError as derr:
+                    outcome = ("隔离失败(%r)且删除失败(%r)，未经验证的数据库仍留在 %s，"
+                               "请勿启动服务并立即人工处理"
+                               % (qerr, derr, p.resolve()))
+            raise RuntimeError(
+                "原数据库不存在且替换后校验未通过：请勿启动服务。%s。"
+                "原始恢复异常=%r。" % (outcome, exc)
+            ) from exc
         raise
     finally:
         if tmp is not None:
             tmp.unlink(missing_ok=True)
-        if rollback is not None:
+        if rollback is not None and not keep_rollback:
             rollback.unlink(missing_ok=True)
 
 
@@ -455,13 +486,15 @@ def ensure_schema() -> None:
                 raise RuntimeError("迁移后数据库完整性校验未通过")
     except Exception as exc:
         # db_conn() 的 finally 已关闭连接；迁移失败必须恢复到升级前状态。
-        # 若恢复本身也失败，保留原始迁移异常作为 cause，避免丢失根因。
+        # 恢复失败时保留原始迁移异常为 cause，并统一报告状态与备份路径。
         if backup_path is not None:
             try:
                 restore_db(backup_path)
             except Exception as rerr:
                 raise RuntimeError(
-                    "迁移失败，且从备份恢复同样失败: %s" % (rerr,)
+                    "迁移失败，且从备份恢复同样失败：当前数据库可能处于不确定状态，请勿启动服务。"
+                    "恢复异常=%r；原始迁移异常=%r；升级前备份保留在 %s。"
+                    % (rerr, exc, backup_path.resolve())
                 ) from exc
         raise
 

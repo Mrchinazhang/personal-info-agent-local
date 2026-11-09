@@ -817,6 +817,81 @@ class MigrationTest(unittest.TestCase):
                          "失败次数增加不得清理或挤掉任何有效备份")
         self.assertEqual(list(bdir.glob("*.tmp")), [], "失败不得残留临时文件")
 
+    def test_rollback_failure_keeps_pre_restore_copy(self):
+        """B1：替换后校验失败 + 自动回滚失败 → 保留回滚副本并报告状态与两个异常。"""
+        main = Path(self.tmp) / "current.db"
+        build_v0_db(str(main), rows=3)
+        os.environ["PIA_DB"] = str(main)
+        original_bytes = main.read_bytes()
+        backup = Path(self.tmp) / "good-backup.db"
+        backup.write_bytes(original_bytes)
+
+        real_validate = server._validate_db_file
+        real_replace = os.replace
+        state = {"n": 0}
+
+        def fail_post_restore(path):
+            if Path(path) == main:
+                raise RuntimeError("injected post-restore validation failure")
+            return real_validate(path)
+
+        def fail_rollback(a, b):
+            state["n"] += 1
+            if state["n"] == 1:            # tmp -> p，正常原子替换
+                return real_replace(a, b)
+            raise OSError("injected rollback failure")   # rollback -> p，注入失败
+
+        with mock.patch.object(server, "_validate_db_file", side_effect=fail_post_restore), \
+                mock.patch.object(server.os, "replace", side_effect=fail_rollback):
+            with self.assertRaises(RuntimeError) as ctx:
+                server.restore_db(backup)
+
+        msg = str(ctx.exception)
+        copies = list(Path(self.tmp).glob("*.pre-restore"))
+        self.assertEqual(len(copies), 1, "回滚失败时必须保留唯一的恢复前副本")
+        self.assertEqual(copies[0].read_bytes(), original_bytes,
+                         "保留的副本必须是恢复前的原库内容")
+        self.assertIn("可能处于不确定状态", msg)
+        self.assertIn("请勿启动服务", msg)
+        self.assertIn(str(copies[0].resolve()), msg, "异常消息必须给出副本完整路径")
+        self.assertIn("injected rollback failure", msg, "回滚异常须以 repr 呈现")
+        self.assertIn("injected post-restore validation failure", msg)
+        self.assertIsNotNone(ctx.exception.__cause__,
+                             "原始恢复异常必须保留为 __cause__")
+        self.assertIn("injected post-restore validation failure",
+                      str(ctx.exception.__cause__))
+
+    def test_restore_failure_without_original_db_clears_main_path(self):
+        """B2：原库不存在 + 替换后校验失败 → 无效库不得留在正式主库路径。"""
+        main = Path(self.tmp) / "absent.db"
+        self.assertFalse(main.exists())
+        os.environ["PIA_DB"] = str(main)
+        backup = Path(self.tmp) / "good-backup.db"
+        build_v0_db(str(backup), rows=2)
+
+        real_validate = server._validate_db_file
+
+        def fail_post_restore(path):
+            if Path(path) == main:
+                raise RuntimeError("injected post-restore validation failure")
+            return real_validate(path)
+
+        with mock.patch.object(server, "_validate_db_file", side_effect=fail_post_restore):
+            with self.assertRaises(RuntimeError) as ctx:
+                server.restore_db(backup)
+
+        self.assertFalse(main.exists(), "失败后主库路径不得留下未经验证的库")
+        quarantined = list(Path(self.tmp).glob("*.failed-restore"))
+        self.assertEqual(len(quarantined), 1, "未经验证的库应被隔离到隔离文件")
+        msg = str(ctx.exception)
+        self.assertIn("请勿启动服务", msg)
+        self.assertIn(str(quarantined[0].resolve()), msg, "异常消息必须给出隔离文件路径")
+        self.assertIn("主库路径当前不存在", msg)
+        self.assertIn("injected post-restore validation failure", msg)
+        self.assertEqual(list(Path(self.tmp).glob("*.pre-restore")), [])
+        self.assertEqual(list(Path(self.tmp).glob("*.restore-tmp")), [])
+        self.assertIsNotNone(ctx.exception.__cause__)
+
 
 class ForeignKeyTest(unittest.TestCase):
     """阶段 2-A 安全增强：items.source_id 外键（REFERENCES sources(id) ON DELETE RESTRICT）。"""
