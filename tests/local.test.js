@@ -4,9 +4,12 @@
  * 运行： node tests/local.test.js
  *
  * 两套关注点：
- *   1) 静态契约：前端确实脱离了云端 SDK、脚本顺序正确、app.js 与原版字节级一致；
+ *   1) 静态契约：前端确实脱离了云端 SDK、脚本顺序正确；
  *   2) 运行契约：在 vm 沙箱里加载 config.js + local-cloud.js，用假 fetch
  *      验证 auth / database / llm 三大模块发给 /api 的请求形状完全符合 server.py。
+ *
+ *   阶段 2 决策 B：本地版 app.js 自阶段 2 起独立演进，不再要求与云端版字节级一致。
+ *   兼容性改由「共同数据接口契约 + 共同业务行为」验证（见下方 database 段）。
  */
 'use strict';
 
@@ -78,17 +81,8 @@ t('server.py 具备回环绑定、Origin 校验、体积上限与离线规则引
   }
 });
 
-t('前端四个文件与云端开源版字节级一致（app.js 零改动）', () => {
-  if (!fs.existsSync(path.join(CLOUD_ROOT, 'app.js'))) {
-    skipped++;
-    console.log('    (跳过：未找到同级 personal-info-agent 云端版目录)');
-    return;
-  }
-  for (const name of ['app.js', 'i18n.js', 'i18n-dict.js', 'styles.css']) {
-    assert.strictEqual(read(name), fs.readFileSync(path.join(CLOUD_ROOT, name), 'utf8'),
-      name + ' 与云端版不一致');
-  }
-});
+// 决策 B：本地版 app.js 自阶段 2 起独立演进，不再要求与云端版字节级一致。
+// 下方 database 段改用「共同数据接口契约 + 共同业务行为」验证兼容性。
 
 // ---------------------------------------------------------------- vm 沙箱
 function fakeResponse(body, opts = {}) {
@@ -271,6 +265,50 @@ t('HTTP 非 2xx 抛出带 status 的 Error', async () => {
     () => Promise.resolve(cloudOf(ctx).database.from('items').select('*')),
     (e) => e.status === 403 && /blocked/.test(e.message)
   );
+});
+
+// ---------------------------------------------------------------- 阶段 2-A 契约
+// 决策 B：不再比对字节，改为验证「共同数据接口契约 + 共同业务行为」。
+t('sources 表走与云端相同的 /api/db 契约（接口兼容）', async () => {
+  const { ctx, calls } = makeContext();
+  await cloudOf(ctx).database.from('sources')
+    .insert([{ kind: 'file_import', title: 'notes.txt', ref: '/x/notes.txt' }]).select();
+  let b = lastBody(calls);
+  assert.strictEqual(b.table, 'sources');
+  assert.strictEqual(b.op, 'insert');
+  assert.strictEqual(b.payload[0].kind, 'file_import');
+  await cloudOf(ctx).database.from('sources').select('*').limit(10);
+  b = lastBody(calls);
+  assert.strictEqual(b.table, 'sources');
+  assert.strictEqual(b.op, 'select');
+});
+
+t('items 写入来源语义字段经同一接口回传（业务行为一致）', async () => {
+  const { ctx, calls } = makeContext();
+  await cloudOf(ctx).database.from('items').insert([{
+    title: 'A', source_id: 1, state: 'draft', confidence: 0.5,
+  }]).select();
+  const b = lastBody(calls);
+  assert.strictEqual(b.table, 'items');
+  assert.strictEqual(b.payload[0].source_id, 1);
+  assert.strictEqual(b.payload[0].state, 'draft');
+  assert.strictEqual(b.payload[0].confidence, 0.5);
+});
+
+t('items 查询信封保持云端约定的字段（接口未漂移）', async () => {
+  const { ctx, calls } = makeContext();
+  const q = cloudOf(ctx).database.from('items')
+    .select('id,title').order('created_at', { ascending: false })
+    .limit(50).eq('category', 'idea');
+  await q;
+  const b = lastBody(calls);
+  // 与云端 Supabase 风格的契约完全一致：表/操作/列/过滤/排序/限量/返回标记
+  assert.strictEqual(b.table, 'items');
+  assert.strictEqual(b.op, 'select');
+  assert.strictEqual(b.columns, 'id,title');
+  assert.deepStrictEqual(b.order, { column: 'created_at', ascending: false });
+  assert.strictEqual(b.limit, 50);
+  assert.deepStrictEqual(b.filters[0], { kind: 'eq', column: 'category', value: 'idea' });
 });
 
 // ---------------------------------------------------------------- llm

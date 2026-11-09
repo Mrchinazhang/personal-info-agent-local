@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -64,6 +66,36 @@ def stream_text(resp) -> str:
         assert "error" not in obj, obj
         out.append(obj["content"])
     return "".join(out)
+
+
+# ---------------------------------------------------------------- 阶段 2-A 迁移夹具
+def build_v0_db(path, rows=2):
+    """构造一个「阶段 2 之前的旧库」：只有基线四表 + 若干 items，无 schema_migrations。"""
+    old = os.environ.get("PIA_DB")
+    os.environ["PIA_DB"] = str(path)
+    try:
+        with server.db_conn() as conn:
+            conn.executescript(server.SCHEMA)
+            for i in range(rows):
+                conn.execute(
+                    "INSERT INTO items (title,content,category,created_at,updated_at) "
+                    "VALUES (?,?,?,?,?)",
+                    ("旧条目%d" % i, "内容", "idea", server.now_iso(), server.now_iso()),
+                )
+    finally:
+        if old is None:
+            os.environ.pop("PIA_DB", None)
+        else:
+            os.environ["PIA_DB"] = old
+
+
+def schema_signature(conn):
+    tables = {}
+    for name in ("items", "item_links", "chats", "reports", "sources"):
+        tables[name] = [r[1] for r in conn.execute("PRAGMA table_info(%s)" % name).fetchall()]
+    idx = [r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%' ORDER BY name")]
+    return tables, idx
 
 
 # ---------------------------------------------------------------- 提示词样本
@@ -475,6 +507,176 @@ class LlmTest(unittest.TestCase):
 
     def test_ollama_cannot_point_outside_loopback(self):
         self.assertEqual(server.ollama_base(), "http://127.0.0.1:1")
+
+
+class MigrationTest(unittest.TestCase):
+    """阶段 2-A：版本化迁移的备份 / 回滚 / 幂等 / 旧数据 / 双路径等价。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pia-mig-")
+        self.orig_db = os.environ.get("PIA_DB")
+        os.environ["PIA_DB"] = str(Path(self.tmp) / "pia.db")
+        self._orig_fail = os.environ.pop("PIA_MIGRATION_FAIL_AT", None)
+
+    def tearDown(self):
+        if self.orig_db is None:
+            os.environ.pop("PIA_DB", None)
+        else:
+            os.environ["PIA_DB"] = self.orig_db
+        if self._orig_fail is None:
+            os.environ.pop("PIA_MIGRATION_FAIL_AT", None)
+        else:
+            os.environ["PIA_MIGRATION_FAIL_AT"] = self._orig_fail
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_fresh_db_reaches_latest_version_with_sources(self):
+        server.ensure_schema()
+        with server.db_conn() as conn:
+            ver = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+            self.assertEqual(ver, server.SCHEMA_VERSION)
+            self.assertIsNotNone(
+                conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='sources'").fetchone())
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(items)").fetchall()]
+            for col in ("source_id", "state", "confidence"):
+                self.assertIn(col, cols)
+
+    def test_legacy_rows_backfilled_as_confirmed_full_confidence(self):
+        db_path = Path(self.tmp) / "old.db"
+        build_v0_db(str(db_path), rows=3)
+        # 用这个旧库作为当前库并升级
+        os.environ["PIA_DB"] = str(db_path)
+        server.ensure_schema()
+        with server.db_conn() as conn:
+            rows = conn.execute("SELECT source_id, state, confidence FROM items").fetchall()
+            self.assertEqual(len(rows), 3)
+            for r in rows:
+                self.assertEqual(r[0], 1)          # 指向 legacy 来源
+                self.assertEqual(r[1], "confirmed")
+                self.assertEqual(r[2], 1.0)
+            legacy = conn.execute("SELECT id, kind FROM sources WHERE id=1").fetchone()
+            self.assertEqual(legacy[1], "legacy")
+
+    def test_migration_is_idempotent(self):
+        db_path = Path(self.tmp) / "old.db"
+        build_v0_db(str(db_path), rows=1)
+        os.environ["PIA_DB"] = str(db_path)
+        server.ensure_schema()
+        with server.db_conn() as conn:
+            v1 = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+        # 再跑一次不应报错，且版本不变
+        server.ensure_schema()
+        with server.db_conn() as conn:
+            v2 = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(items)").fetchall()]
+        self.assertEqual(v1, v2)
+        self.assertIn("source_id", cols)
+
+    def test_failed_migration_rolls_back_and_restores_backup(self):
+        db_path = Path(self.tmp) / "old.db"
+        build_v0_db(str(db_path), rows=2)
+        os.environ["PIA_DB"] = str(db_path)
+        os.environ["PIA_MIGRATION_FAIL_AT"] = "1"
+        with self.assertRaises(RuntimeError):
+            server.ensure_schema()
+        # 已回滚：items 无新列、sources 不存在、旧数据行数不变
+        with server.db_conn() as conn:
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(items)").fetchall()]
+            sources = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='sources'").fetchone()
+            cnt = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+        self.assertNotIn("source_id", cols)
+        self.assertIsNone(sources)
+        self.assertEqual(cnt, 2)
+        # 备份文件已生成（库名 old.db → 备份为 old.bak.*.db）
+        backups_dir = Path(self.tmp) / "backups"
+        self.assertTrue(backups_dir.exists() and any(backups_dir.iterdir()),
+                        "应当生成迁移前备份")
+
+    def test_fresh_and_migrated_schemas_are_identical(self):
+        fresh = Path(self.tmp) / "fresh.db"
+        old = Path(self.tmp) / "old.db"
+        # 全新库
+        os.environ["PIA_DB"] = str(fresh)
+        server.ensure_schema()
+        # 旧库升级
+        build_v0_db(str(old), rows=2)
+        os.environ["PIA_DB"] = str(old)
+        server.ensure_schema()
+        with server.db_conn() as conn:        # 注意：db_conn 读当前 PIA_DB
+            fresh_sig = schema_signature(conn)
+        os.environ["PIA_DB"] = str(fresh)
+        with server.db_conn() as conn:
+            old_sig = schema_signature(conn)
+        self.assertEqual(fresh_sig, old_sig, "全新库与升级库的 schema 必须一致")
+
+    def test_backup_retention_keeps_only_latest_n(self):
+        os.environ["PIA_DB"] = str(Path(self.tmp) / "pia.db")
+        bdir = Path(self.tmp) / "backups"
+        bdir.mkdir()
+        # 造 12 个假备份（不同 mtime），模拟历史堆积
+        for i in range(12):
+            f = bdir / ("pia.bak.20260101-%06d.db" % i)
+            f.write_text("x")
+            os.utime(f, (i, i))
+        server._clean_old_backups(bdir, keep=10)
+        remaining = sorted(bdir.glob("pia.bak.*.db"))
+        self.assertEqual(len(remaining), 10, "只应保留最近 10 个备份")
+
+
+class SourceAndStateTest(unittest.TestCase):
+    """阶段 2-A：sources 表 + items 的 source_id/state/confidence 业务校验。"""
+
+    def setUp(self):
+        server.init_db()
+        self.c = server.app.test_client()
+        with server.db_conn() as conn:
+            for t in ("item_links", "chats", "reports", "items", "sources"):
+                conn.execute('DELETE FROM "%s"' % t)
+            try:
+                conn.execute("DELETE FROM sqlite_sequence")
+            except sqlite3.Error:
+                pass
+
+    def test_items_insert_accepts_source_state_confidence(self):
+        r = post_db(self.c, db("items", "insert", payload=[{
+            "title": "t", "content": "c", "category": "idea",
+            "source_id": 1, "state": "draft", "confidence": 0.5}], returning=True))
+        row = r.get_json()["data"][0]
+        self.assertEqual(row["state"], "draft")
+        self.assertEqual(row["confidence"], 0.5)
+        self.assertEqual(row["source_id"], 1)
+
+    def test_items_insert_defaults_state_confirmed_confidence_one(self):
+        r = post_db(self.c, db("items", "insert", payload=[{
+            "title": "t", "content": "c", "category": "idea"}], returning=True))
+        row = r.get_json()["data"][0]
+        self.assertEqual(row["state"], "confirmed")
+        self.assertEqual(row["confidence"], 1.0)
+        self.assertIsNone(row.get("source_id"))
+
+    def test_invalid_state_rejected(self):
+        r = post_db(self.c, db("items", "insert", payload=[{
+            "title": "t", "state": "bogus"}], returning=True))
+        err = r.get_json()["error"]
+        self.assertIsNotNone(err)
+        self.assertEqual(err["code"], "invalid_state")
+
+    def test_invalid_confidence_rejected(self):
+        r = post_db(self.c, db("items", "update", payload={"confidence": 2},
+                               filters=[{"kind": "eq", "column": "id", "value": 1}],
+                               returning=True))
+        err = r.get_json()["error"]
+        self.assertIsNotNone(err)
+        self.assertEqual(err["code"], "invalid_confidence")
+
+    def test_sources_crud_via_api(self):
+        r = post_db(self.c, db("sources", "insert", payload=[{
+            "kind": "file_import", "title": "notes.txt", "ref": "/x/notes.txt"}], returning=True))
+        row = r.get_json()["data"][0]
+        self.assertEqual(row["kind"], "file_import")
+        self.assertEqual(row["meta"], {})           # JSON 默认 {}
+        r2 = post_db(self.c, db("sources", "select", columns="*", filters=[], limit=10))
+        self.assertGreaterEqual(len(r2.get_json()["data"]), 1)
 
 
 if __name__ == "__main__":
