@@ -25,7 +25,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: 后端单测（32 项，临时库，不发任何外网请求）
+      - name: 后端单测（33 项，临时库，不发任何外网请求）
         run: python -m unittest discover -s tests -p "test_*.py" -v
 
   frontend:

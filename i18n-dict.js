@@ -330,5 +330,11 @@ window.I18N_EN = {
   "累计 AI 调用次数已达上限（%s 次），已自动终止": "Lifetime AI call limit reached (%s); calls have been stopped automatically.",
   "今日 AI 额度消耗已达上限（%s credits），已自动终止": "Daily AI credit budget reached (%s credits); calls have been stopped automatically.",
   "今日 AI token 消耗已达上限（%s），已自动终止": "Daily AI token budget reached (%s); calls have been stopped automatically.",
-  "平台额度已用尽或触发限流，AI 调用已自动停止；请在浏览器控制台执行 PIA_LLM_BUDGET.reset() 后重试": "Platform quota exhausted or rate-limited; AI calls have been stopped. Run PIA_LLM_BUDGET.reset() in the browser console before retrying."
+  "平台额度已用尽或触发限流，AI 调用已自动停止；请在浏览器控制台执行 PIA_LLM_BUDGET.reset() 后重试": "Platform quota exhausted or rate-limited; AI calls have been stopped. Run PIA_LLM_BUDGET.reset() in the browser console before retrying.",
+  "导出数据": "Export data",
+  "导出全部数据为 JSON 文件": "Export all data as a JSON file",
+  "正在导出数据…": "Exporting data...",
+  "已导出 %s 条记录到 JSON 文件": "Exported %s records to a JSON file",
+  "已导出（部分表达到单次上限，可能不完整）：": "Export incomplete (a table hit the single-query limit): ",
+  "导出失败：": "Export failed: "
 };

@@ -15,3 +15,14 @@ venv/
 _smoke.db
 *.log
 .DS_Store
+
+# 发布/同步时必须留在本机的配置、记忆与临时文件
+.env
+.env.*
+!.env.example
+.workbuddy/
+.tmp_tools/
+_security_backup_*/
+audit_history/
+*.bak
+*.backup

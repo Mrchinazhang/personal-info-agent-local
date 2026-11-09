@@ -42,6 +42,21 @@ from urllib.parse import urlparse
 
 from flask import Flask, Response, jsonify, request, send_from_directory, stream_with_context
 
+# pythonw.exe（无控制台窗口）下 sys.stdout / sys.stderr 为 None，print 与
+# werkzeug 日志都会抛 AttributeError。这里兜底到 data/server.log，使服务可以
+# 完全无窗口地在后台运行（开机自启用的就是 pythonw）。
+if sys.stdout is None or sys.stderr is None:
+    _LOG_DIR = Path(__file__).resolve().parent / "data"
+    try:
+        _LOG_DIR.mkdir(parents=True, exist_ok=True)
+        _LOG_FH = open(_LOG_DIR / "server.log", "a", encoding="utf-8", buffering=1)
+    except OSError:
+        _LOG_FH = open(os.devnull, "w", encoding="utf-8")
+    if sys.stdout is None:
+        sys.stdout = _LOG_FH
+    if sys.stderr is None:
+        sys.stderr = _LOG_FH
+
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB = BASE_DIR / "data" / "pia.db"
 MAX_BODY_BYTES = 4 * 1024 * 1024
@@ -341,7 +356,7 @@ def health():
         "data": {
             "ok": True,
             "db": str(db_path()),
-            "ollama": bool(probe_ollama()),
+            "ollama": bool(cached_ollama_models()),
             "engine": "ollama + local-rules",
         },
         "error": None,
@@ -573,8 +588,17 @@ def db_query():
 
 
 # ---------------------------------------------------------------- 模型目录
-def probe_ollama(timeout: float = 1.2):
-    """返回 Ollama 已安装模型名列表；没装 / 没启动就返回 []（不报错、不阻塞启动）。"""
+# 探测缓存：本机没装 Ollama 时，一次探测必然要等满 timeout 才返回（本机回环连
+# 一个没人监听的端口也要 ~2s 才拿到拒绝）。若让 /api/health 每次都同步探测，
+# 每个请求都会白等一次。改为「TTL 缓存 + 后台刷新」：请求侧只读缓存，永不阻塞。
+_OLLAMA_LOCK = threading.Lock()
+_OLLAMA_CACHE = {"models": [], "at": 0.0}
+_OLLAMA_TTL = 30.0           # 缓存有效期（秒）
+_OLLAMA_PROBE_TIMEOUT = 0.5  # 单次探测超时，仅首次与后台刷新会用到
+
+
+def _probe_ollama_uncached(timeout: float = _OLLAMA_PROBE_TIMEOUT):
+    """真正发起探测；只有缓存过期或后台刷新时才会走到这里。"""
     try:
         base = ollama_base()
         with urllib.request.urlopen(base + "/api/tags", timeout=timeout) as resp:
@@ -591,9 +615,45 @@ def probe_ollama(timeout: float = 1.2):
         return []
 
 
+def probe_ollama(timeout: float = None, force: bool = False):
+    """返回 Ollama 已安装模型名列表；没装 / 没启动就返回 []（不报错、不阻塞启动）。
+
+    命中缓存时立即返回；缓存过期才重新探测，需要实时结果时传 force=True。
+    """
+    now = time.monotonic()
+    with _OLLAMA_LOCK:
+        cached_at = _OLLAMA_CACHE["at"]
+        if not force and cached_at and (now - cached_at) < _OLLAMA_TTL:
+            return list(_OLLAMA_CACHE["models"])
+    models = _probe_ollama_uncached(timeout or _OLLAMA_PROBE_TIMEOUT)
+    with _OLLAMA_LOCK:
+        _OLLAMA_CACHE["models"] = list(models)
+        _OLLAMA_CACHE["at"] = time.monotonic()
+    return models
+
+
+def cached_ollama_models():
+    """只读缓存、不发起任何网络探测：请求路径专用，保证 0 阻塞。"""
+    with _OLLAMA_LOCK:
+        return list(_OLLAMA_CACHE["models"])
+
+
+def start_ollama_refresh():
+    """后台定时刷新缓存，保证请求侧始终命中，不会在过期瞬间阻塞一次。"""
+    def _loop():
+        while True:
+            try:
+                probe_ollama(force=True)
+            except Exception:
+                pass
+            time.sleep(_OLLAMA_TTL)
+
+    threading.Thread(target=_loop, daemon=True, name="ollama-refresh").start()
+
+
 @app.get("/api/llm/models")
 def llm_models():
-    ollama = probe_ollama()
+    ollama = cached_ollama_models()
     models = [{
         "id": "local-rules",
         "name": "本地规则引擎 · 离线可用 / Offline rules",
@@ -1023,6 +1083,13 @@ def llm_chat():
     )
 
 
+
+
+def lan_access_enabled() -> bool:
+    """PIA_ALLOW_LAN 仅接受明确真值，避免字符串 "0" 被当作开启。"""
+    return os.environ.get("PIA_ALLOW_LAN", "").strip().lower() in ("1", "true", "yes")
+
+
 # ---------------------------------------------------------------- 入口
 def main(argv=None):
     parser = argparse.ArgumentParser(description="个人信息管家 · 本地离线版")
@@ -1033,9 +1100,14 @@ def main(argv=None):
                         help="服务起来后自动打开浏览器（启动脚本用）")
     args = parser.parse_args(argv)
 
-    if args.host not in ("127.0.0.1", "localhost", "::1") and not os.environ.get("PIA_ALLOW_LAN"):
+    # 仅将明确的真值视为允许；"0"、"false"、空字符串等均保持关闭。
+    allow_lan = lan_access_enabled()
+    loopback_hosts = ("127.0.0.1", "localhost", "::1")
+    if args.host not in loopback_hosts and not allow_lan:
         print("[拒绝] 默认只监听本机回环；确需局域网访问请显式设置 PIA_ALLOW_LAN=1", file=sys.stderr)
         return 2
+    if args.host not in loopback_hosts and allow_lan:
+        print("[警告] 已启用局域网监听。请确保网络可信，并使用防火墙限制访问。", file=sys.stderr)
     try:
         ollama_base()
     except RuntimeError as e:
@@ -1044,6 +1116,7 @@ def main(argv=None):
 
     init_db()
     models = probe_ollama()
+    start_ollama_refresh()
     print("=" * 62)
     print("  个人信息管家 · 本地离线版")
     print("  打开： http://%s:%d" % ("127.0.0.1" if args.host == "::1" else args.host, args.port))

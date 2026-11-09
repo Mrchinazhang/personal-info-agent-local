@@ -1,22 +1,20 @@
 # 个人信息管家 · 本地离线版
 
-**仓库**：https://github.com/Mrchinazhang/personal-info-agent-local
-[![CI](https://github.com/Mrchinazhang/personal-info-agent-local/actions/workflows/ci.yml/badge.svg)](https://github.com/Mrchinazhang/personal-info-agent-local/actions/workflows/ci.yml)
-
 > **¥0 / 0 token / 0 云端调用。** 界面、业务逻辑、中英双语全部保留，
 > 但数据只存在你这台电脑，AI 只用本机算力，永远不会消耗 WorkBuddy 额度或产生账单。
 
 > ### 当前使用建议（2026-11-06 起）
 > **日常记录、整理、问答一律用这一版**，双击 `start.bat` → <http://127.0.0.1:8771/>。
-> 线上双语版保留给国际友人试用：目前 AI 已恢复为「限额模式」，每浏览器 10 次/天、
-> 累计 100 次，平台回 `quota_` 自动熔断，但**每次 AI 调用仍扣创建者积分**。
-> 平台 SDK 不暴露余额 / 总额度 / 账期，具体数字只能到 WorkBuddy 控制台查；
-> 那道护栏是**按浏览器的客户端软闸**，挡不住有人直接写脚本调接口，也不是平台级硬限。
-> 想让线上全局零消耗：把线上 `config.js` 的 `aiEnabled` 改成 `false` 后重新发布。
-> 两个版本互不冲突，也不会互相覆盖数据。
+> 线上双语版仍保留给国际友人试用，但每次 AI 调用扣的是**创建者额度**，
+> 而平台 SDK 不暴露余额 / 总额度 / 账期，只能到 WorkBuddy 控制台查。
+> 线上版虽已加 `llm-guard.js` 熔断（默认每浏览器 20 次/天、累计 200 次，
+> 平台回 `quota_` 自动停止），但那是**按浏览器的客户端软闸**，挡不住有人
+> 直接写脚本调接口，也不是平台级硬限。
+> 想全局零消耗有两条路：把线上 `config.js` 的 `aiEnabled` 改成 `false` 后重新发布，
+> 或者干脆就一直用这一版。两者不冲突，也不会互相覆盖数据。
 
-本仓库是 [`personal-info-agent`](https://github.com/Mrchinazhang/personal-info-agent) 云端开源版的**独立开源仓库**，
-不是云端版的 git 分支，也不是对它的修改。两者可以同时存在、互不干扰，数据也互不迁移。
+这是 [`personal-info-agent`](https://github.com/Mrchinazhang/personal-info-agent) 云端开源版的**独立本地分支**，不是对云端版的修改。
+两者可以同时存在、互不干扰，数据也互不迁移。
 
 ---
 
@@ -48,17 +46,18 @@ exact Origin 匹配，所以「只把静态文件搬到 GitHub Pages / Cloudflar
 
 ---
 
-## 二、启动
-
-### 0. 先拿代码
-```bash
-git clone https://github.com/Mrchinazhang/personal-info-agent-local.git
-cd personal-info-agent-local
-```
-（已经在本机跑起来的可以跳过这步。）
+## 二、三步启动
 
 ### Windows（最省事）
 双击 **`start.bat`**。它会自动检查 Python、按需安装唯一依赖 Flask，然后打开浏览器。
+
+### Windows 常驻 / 开机自启（推荐日常）
+双击 **`start-bg.bat`**：用 `pythonw` 无窗口运行，并调用已注册的计划任务
+`PIA-Local-Server`（登录 Windows 后自动启动，已运行则不会开第二个实例）。
+停止用 **`stop-server.bat`**，运行日志在 `data/server.log`。
+
+> `/api/health` 曾经每次都要等满 1.2 秒（本机没装 Ollama 时，探测必然超时）。
+> 现已改为 **30 秒 TTL 缓存 + 后台刷新**，请求侧只读缓存，实测降到 20 ms 内。
 
 ### macOS / Linux
 ```bash
@@ -167,10 +166,10 @@ Google OAuth 已 retired，OpenAI / ChatGPT / TikTok / GitHub 从未提供；
 
 ## 七、测试
 
-零第三方测试框架，两套共 67 项：
+零第三方测试框架，两套共 54 项：
 
 ```bash
-# 后端：数据库 CRUD / 安全 / 规则引擎 + 同步脚本（45 项，临时库，不碰真实数据）
+# 后端：数据库 CRUD / 安全 / 规则引擎（32 项，临时库，不碰真实数据）
 python -m unittest discover -s tests -p "test_*.py" -v
 
 # 前端：脚本顺序、去 CDN、app.js 字节级一致、兼容层请求形状（22 项）
@@ -180,25 +179,6 @@ node tests/local.test.js
 后端测试把 Ollama 指向 `127.0.0.1:1`，**真实覆盖「没装 Ollama」这条路径**，
 不发任何外网请求。`tests/local.test.js` 在 vm 沙箱里用假 `fetch` 验证
 `auth` / `database` / `llm` 三大模块发给 `/api` 的请求形状。
-`tests/test_sync.py` 用临时目录验证一键同步脚本的白名单边界、dry-run 与推送顺序，
-同样不触碰真实的运行版目录。
-
-### 维护者：从运行版一键同步
-
-日常真正跑 Flask 服务的目录和本仓库是两个独立目录。改完运行版的代码后，
-双击本目录的 **`sync.bat`**（或运行 `python sync.py`）即可自动复制变更、提交并推送：
-
-```bash
-python sync.py --dry-run       # 只预览会同步哪些文件，不写入、不提交
-python sync.py --no-push       # 只提交，不推送
-python sync.py -m "fix: ..."   # 自定义提交信息
-python sync.py --src D:/path/to/local   # 运行版换了位置时手动指定
-```
-
-脚本只按白名单复制 **15 个代码文件**：**不会覆盖仓库版 `README.md`**（含仓库地址、
-CI 徽章、clone 步骤），不会删除 `.github/`、`CONTRIBUTING.md`、`SECURITY.md`，
-也绝不会把 `data/pia.db`、`__pycache__` 带进仓库；推送前还会校验 `origin` 是预期仓库。
-若运行版的说明文档有更新，请手动合并到仓库版 README。
 
 ---
 
@@ -206,33 +186,25 @@ CI 徽章、clone 步骤），不会删除 `.github/`、`CONTRIBUTING.md`、`SEC
 
 ```
 personal-info-agent-local/
-├── index.html          页面骨架（已去掉云端 SDK CDN，缓存版本 20261106e）
+├── index.html          页面骨架（已去掉云端 SDK CDN，缓存版本 20261106c）
 ├── app.js              业务逻辑 —— 与云端开源版字节级一致，零改动
 ├── i18n.js             零依赖双语层
-├── i18n-dict.js        325 条英文字典
+├── i18n-dict.js        319 条英文字典
 ├── styles.css          主题与组件样式
 ├── config.js           本机公开配置（无密钥，apiBase = /api）
 ├── local-cloud.js      云端 SDK 的本地替身（核心新增）
 ├── server.py           Flask + SQLite + Ollama + 本地规则引擎（核心新增）
 ├── requirements.txt    唯一依赖：Flask
-├── start.bat           Windows 双击启动
+├── start.bat           Windows 双击启动（前台，带终端窗口）
+├── start-bg.bat        Windows 无窗口启动 / 调用计划任务
+├── stop-server.bat     停止后台服务
 ├── start.sh            macOS / Linux 启动
-├── sync.py             一键同步：运行版 → 本仓库
-├── sync.bat            Windows 双击同步
 ├── tests/
 │   ├── test_server.py  后端 32 项
-│   ├── test_sync.py    同步脚本 13 项
 │   └── local.test.js   前端契约 22 项
-├── .github/
-│   ├── workflows/ci.yml  Python 3.10–3.13 单测 + 前端契约 + 凭证扫描
-│   └── FUNDING.yml       爱发电赞助入口
-├── CONTRIBUTING.md     贡献约定
-├── SECURITY.md         安全边界与已知限制
 ├── LICENSE             MIT
-└── README.md
+└── data/pia.db         运行时生成，已 gitignore
 ```
-
-> `data/pia.db` 首次启动时自动生成，已被 `.gitignore` 排除，**不会出现在仓库里**。
 
 ---
 
@@ -279,5 +251,3 @@ identity providers, and no GPT models exist in its catalogue). This offline edit
 no sign-in at all. For real AI quality, install Ollama and pick a local model in the dropdown.
 
 MIT licensed. Run `python -m unittest discover -s tests -v` and `node tests/local.test.js`.
-
-Repository & issues: https://github.com/Mrchinazhang/personal-info-agent-local

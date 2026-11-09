@@ -369,6 +369,23 @@ class SecurityTest(unittest.TestCase):
             "messages": [{"role": "user", "content": big}]})
         self.assertEqual(r.status_code, 413)
 
+    def test_lan_flag_requires_explicit_truthy_value(self):
+        old = os.environ.get("PIA_ALLOW_LAN")
+        try:
+            for value in ("0", "false", "no", "", "off"):
+                os.environ["PIA_ALLOW_LAN"] = value
+                self.assertFalse(server.lan_access_enabled(), value)
+            for value in ("1", "true", "yes", " TRUE "):
+                os.environ["PIA_ALLOW_LAN"] = value
+                self.assertTrue(server.lan_access_enabled(), value)
+            os.environ.pop("PIA_ALLOW_LAN", None)
+            self.assertFalse(server.lan_access_enabled())
+        finally:
+            if old is None:
+                os.environ.pop("PIA_ALLOW_LAN", None)
+            else:
+                os.environ["PIA_ALLOW_LAN"] = old
+
     def test_ollama_url_must_be_loopback(self):
         old = os.environ.get("PIA_OLLAMA")
         try:

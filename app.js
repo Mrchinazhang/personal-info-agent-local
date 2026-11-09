@@ -451,6 +451,9 @@
       state.reports = []
       showAuth()
     })
+
+    var exportBtn = $('#export-btn')
+    if (exportBtn) exportBtn.addEventListener('click', exportAllData)
   }
 
   /* ---------------- 模型 ---------------- */
@@ -490,6 +493,67 @@
 
   async function loadReports() {
     state.reports = unwrap(await cloud.database.from('reports').select('*').order('created_at', { ascending: false }).limit(30)) || []
+  }
+
+  /* ---------------- 全量导出（本地冷备份） ----------------
+   * 背景：线上版数据只存在云端 RLS 库里，原先没有导出通道，属于单点。
+   * 这里按当前登录账号（RLS 自动过滤）读取四张表，拼成与
+   * import_cloud_backup.py 兼容的 JSON，纯前端 Blob 下载，不经任何服务器。
+   *
+   * 诚实边界：SDK 查询形状只支持 limit，没有可依赖的分页原语。因此单表
+   * 上限取 1000，命中上限时在文件里写 truncated 标记并提示，绝不把
+   * 「部分数据」伪装成「全量备份」。
+   */
+  var EXPORT_LIMIT = 1000
+
+  async function exportAllData() {
+    var btn = $('#export-btn')
+    if (btn) btn.disabled = true
+    try {
+      toast(tr('正在导出数据…'))
+      var names = ['items', 'item_links', 'chats', 'reports']
+      var tables = {}
+      var truncated = []
+      for (var i = 0; i < names.length; i++) {
+        var n = names[i]
+        var rows = unwrap(await cloud.database.from(n)
+          .select('*').order('created_at', { ascending: false }).limit(EXPORT_LIMIT)) || []
+        tables[n] = rows
+        if (rows.length >= EXPORT_LIMIT) truncated.push(n)
+      }
+      var doc = {
+        format: 'personal-info-agent-backup',
+        version: 1,
+        exported_at: new Date().toISOString(),
+        source: 'site-export://' + (location.origin || 'personal-info-agent'),
+        note: '由应用内「导出数据」按钮生成，仅含当前登录账号可见的数据（RLS）。可交给 import_cloud_backup.py 导入本地离线版。',
+        counts: {},
+        truncated: truncated,
+        tables: tables
+      }
+      names.forEach(function (n) { doc.counts[n] = tables[n].length })
+      var blob = new Blob([JSON.stringify(doc, null, 2)], { type: 'application/json;charset=utf-8' })
+      var url = URL.createObjectURL(blob)
+      var a = document.createElement('a')
+      a.href = url
+      a.download = 'pia-backup-' + new Date().toISOString().slice(0, 10) + '.json'
+      document.body.appendChild(a)
+      a.click()
+      if (a.remove) a.remove()
+      else if (a.parentNode) a.parentNode.removeChild(a)
+      setTimeout(function () { URL.revokeObjectURL(url) }, 2000)
+      if (truncated.length) {
+        toast(tr('已导出（部分表达到单次上限，可能不完整）：') + truncated.join(', '), 6000)
+      } else {
+        var total = 0
+        names.forEach(function (n) { total += tables[n].length })
+        toast(tr('已导出 %s 条记录到 JSON 文件').replace('%s', String(total)), 4000)
+      }
+    } catch (e) {
+      toast(tr('导出失败：') + ((e && e.message) || tr('请稍后重试')))
+    } finally {
+      if (btn) btn.disabled = false
+    }
   }
 
   async function refresh() {

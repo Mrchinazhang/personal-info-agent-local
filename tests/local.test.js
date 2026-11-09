@@ -41,11 +41,14 @@ t('脚本顺序：字典 → i18n → config → local-cloud → app', () => {
   ]);
 });
 
-t('所有静态资源缓存版本号一致且为 20261106e', () => {
+t('所有静态资源缓存版本号一致（不写死具体值）', () => {
   const html = read('index.html');
   const versions = [...html.matchAll(/\?v=([0-9a-z]+)/g)].map((m) => m[1]);
   assert.ok(versions.length >= 6, '版本号数量过少');
-  assert.ok(versions.every((v) => v === '20261106e'), '版本号不一致：' + versions.join(','));
+  // 只校验「全部一致 + 格式合法」，不写死某次发版的值：
+  // 缓存版本号本来就会随每次发布递增，写死会让每次发版都误报。
+  assert.strictEqual(new Set(versions).size, 1, '版本号不一致：' + versions.join(','));
+  assert.ok(/^2026[0-9]{4}[a-z]+$/.test(versions[0]), '版本号格式异常：' + versions[0]);
 });
 
 t('config.js 无密钥、无云资源、apiBase 指向同源 /api', () => {
