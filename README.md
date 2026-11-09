@@ -37,12 +37,13 @@ exact Origin 匹配，所以「只把静态文件搬到 GitHub Pages / Cloudflar
 | 费用 | 访客调用消耗创建者额度 | **永久 ¥0** |
 | 第三方 Key | 不需要 | **不需要，也不要放** |
 | 中英双语 | ✅ | ✅（同一套 `i18n.js` / `i18n-dict.js`） |
-| 业务逻辑 | `app.js` | **字节级相同的同一份 `app.js`** |
+| 业务逻辑 | `app.js` | **本地独立演进（阶段 2 决策 B）；与云端版保持「数据接口契约 + 业务行为」兼容** |
 
 关键做法：新增 `local-cloud.js`，原样复刻云端 SDK 的调用形状
 （`cloud.auth.*` / `cloud.database.from(...).*` / `cloud.llm.*`），
-把请求全部转到同源 `/api`。因此 **`app.js` 一行都没改**，
-以后云端版修了 bug，直接把 `app.js` 复制过来即可。
+把请求全部转到同源 `/api`。本地版 `app.js` 自阶段 2 起**独立演进**，
+不再要求与云端版字节级一致；云端版修复的 bug 经评估后**选择性同步**，
+兼容性由前端契约测试（接口形状 + 业务行为）而非字节比对来保证。
 
 ---
 
@@ -172,7 +173,7 @@ Google OAuth 已 retired，OpenAI / ChatGPT / TikTok / GitHub 从未提供；
 # 后端：数据库 CRUD / 安全 / 规则引擎（32 项，临时库，不碰真实数据）
 python -m unittest discover -s tests -p "test_*.py" -v
 
-# 前端：脚本顺序、去 CDN、app.js 字节级一致、兼容层请求形状（22 项）
+# 前端：脚本顺序、去 CDN、本地 app.js 与云端接口契约/行为一致、兼容层请求形状
 node tests/local.test.js
 ```
 
@@ -187,7 +188,7 @@ node tests/local.test.js
 ```
 personal-info-agent-local/
 ├── index.html          页面骨架（已去掉云端 SDK CDN，缓存版本 20261106c）
-├── app.js              业务逻辑 —— 与云端开源版字节级一致，零改动
+├── app.js              业务逻辑 —— 本地独立演进（决策 B），与云端版接口契约兼容
 ├── i18n.js             零依赖双语层
 ├── i18n-dict.js        319 条英文字典
 ├── styles.css          主题与组件样式
