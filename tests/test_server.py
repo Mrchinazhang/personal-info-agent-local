@@ -21,6 +21,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -90,12 +91,58 @@ def build_v0_db(path, rows=2):
 
 
 def schema_signature(conn):
+    """完整结构签名：字段属性 / 索引唯一性 / 索引字段顺序 / 索引 SQL / 外键定义。
+
+    table_info 元组含 (cid, name, type, notnull, dflt_value, pk)；
+    foreign_key_list 元组含 (..., table, from, to, on_update, on_delete, match)。
+    """
     tables = {}
-    for name in ("items", "item_links", "chats", "reports", "sources"):
-        tables[name] = [r[1] for r in conn.execute("PRAGMA table_info(%s)" % name).fetchall()]
-    idx = [r[0] for r in conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%' ORDER BY name")]
-    return tables, idx
+    rows = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "AND name NOT LIKE 'sqlite_%' ORDER BY name").fetchall()
+    for (name,) in rows:
+        columns = tuple(tuple(r) for r in conn.execute(
+            "PRAGMA table_info(%s)" % name).fetchall())
+        indexes = []
+        for row in conn.execute("PRAGMA index_list(%s)" % name).fetchall():
+            iname, unique = row[1], row[2]
+            index_cols = tuple(tuple(r) for r in conn.execute(
+                "PRAGMA index_info(%s)" % iname).fetchall())
+            sql_row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+                (iname,)).fetchone()
+            indexes.append((iname, unique, index_cols, sql_row[0] if sql_row else None))
+        fks = tuple(tuple(r) for r in conn.execute(
+            "PRAGMA foreign_key_list(%s)" % name).fetchall())
+        tables[name] = (columns, tuple(indexes), fks)
+    return tables
+
+
+def patch_backup_failure():
+    """让 backup_db() 中源连接的 backup() 抛错，用于故障安全测试。"""
+    real_connect = sqlite3.connect
+
+    class ExplodingConnection:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def backup(self, *a, **k):
+            raise OSError("injected backup failure")
+
+        def close(self):
+            self._inner.close()
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    state = {"n": 0}
+
+    def fake_connect(path, *a, **kw):
+        inner = real_connect(path, *a, **kw)
+        state["n"] += 1
+        return ExplodingConnection(inner) if state["n"] == 1 else inner
+
+    return mock.patch.object(server.sqlite3, "connect", side_effect=fake_connect)
 
 
 # ---------------------------------------------------------------- 提示词样本
@@ -592,22 +639,70 @@ class MigrationTest(unittest.TestCase):
         self.assertTrue(backups_dir.exists() and any(backups_dir.iterdir()),
                         "应当生成迁移前备份")
 
+    def test_migration_and_restore_failure_keeps_original_exception(self):
+        """恢复也失败时：原始迁移异常保留为 cause，恢复失败信息不丢失。"""
+        db_path = Path(self.tmp) / "old.db"
+        build_v0_db(str(db_path), rows=2)
+        os.environ["PIA_DB"] = str(db_path)
+        os.environ["PIA_MIGRATION_FAIL_AT"] = "1"
+        with mock.patch.object(server, "restore_db",
+                               side_effect=OSError("injected restore failure")):
+            with self.assertRaises(RuntimeError) as ctx:
+                server.ensure_schema()
+        msg = str(ctx.exception)
+        self.assertIn("迁移失败", msg)
+        self.assertIn("injected restore failure", msg)
+        cause = ctx.exception.__cause__
+        self.assertIsNotNone(cause, "原始迁移异常必须保留为 __cause__")
+        self.assertIn("injected migration failure", str(cause))
+        with server.db_conn() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM items").fetchone()[0], 2)
+
     def test_fresh_and_migrated_schemas_are_identical(self):
         fresh = Path(self.tmp) / "fresh.db"
         old = Path(self.tmp) / "old.db"
-        # 全新库
         os.environ["PIA_DB"] = str(fresh)
         server.ensure_schema()
-        # 旧库升级
         build_v0_db(str(old), rows=2)
         os.environ["PIA_DB"] = str(old)
         server.ensure_schema()
-        with server.db_conn() as conn:        # 注意：db_conn 读当前 PIA_DB
-            fresh_sig = schema_signature(conn)
+        with server.db_conn() as conn:        # 当前 PIA_DB = old
+            migrated_sig = schema_signature(conn)
         os.environ["PIA_DB"] = str(fresh)
         with server.db_conn() as conn:
-            old_sig = schema_signature(conn)
-        self.assertEqual(fresh_sig, old_sig, "全新库与升级库的 schema 必须一致")
+            fresh_sig = schema_signature(conn)
+        self.assertEqual(fresh_sig, migrated_sig,
+                         "全新库与升级库的最终 schema（字段/索引/外键）必须完全一致")
+
+    def test_migration_preserves_legacy_objects(self):
+        """旧结构原有对象逐项保留 + 新增结构符合预期；不要求 v0 与 v1 整体相等。"""
+        db_path = Path(self.tmp) / "old.db"
+        build_v0_db(str(db_path), rows=2)
+        os.environ["PIA_DB"] = str(db_path)
+        with server.db_conn() as conn:
+            before = schema_signature(conn)
+        server.ensure_schema()
+        with server.db_conn() as conn:
+            after = schema_signature(conn)
+        for table, (cols, indexes, fks) in before.items():
+            self.assertIn(table, after, "升级后原有表 %s 丢失" % table)
+            a_cols, a_indexes, a_fks = after[table]
+            for col in cols:
+                self.assertIn(col, a_cols,
+                              "原有字段 %s.%s 的定义在升级后被改动" % (table, col[1]))
+            for idx in indexes:
+                self.assertIn(idx, a_indexes,
+                              "原有索引 %s.%s 在升级后丢失或被改动" % (table, idx[0]))
+            for fk in fks:
+                self.assertIn(fk, a_fks, "原有外键 %s 在升级后丢失" % (table,))
+        self.assertIn("sources", after)
+        new_cols = {c[1] for c in after["items"][0]}
+        self.assertTrue({"source_id", "state", "confidence"}.issubset(new_cols))
+        self.assertTrue(
+            any(fk[2] == "sources" and fk[6] == "RESTRICT"
+                for fk in after["items"][2]),
+            "items.source_id 应有指向 sources、ON DELETE RESTRICT 的外键")
+        self.assertTrue(any(i[0] == "idx_sources_kind" for i in after["sources"][1]))
 
     def test_backup_retention_keeps_only_latest_n(self):
         os.environ["PIA_DB"] = str(Path(self.tmp) / "pia.db")
@@ -655,6 +750,72 @@ class MigrationTest(unittest.TestCase):
         self.assertEqual(titles, {"旧条目0", "旧条目1", "旧条目2"})
         self.assertEqual(integrity, "ok")           # restore_db 内部已校验，这里再确认
         self.assertEqual(fk, [])
+
+    def test_restore_failure_leaves_current_db_untouched(self):
+        """恢复校验失败：拒绝恢复，原库字节/结构/数据完全不变。"""
+        db_path = Path(self.tmp) / "current.db"
+        build_v0_db(str(db_path), rows=3)
+        os.environ["PIA_DB"] = str(db_path)
+        before_bytes = db_path.read_bytes()
+
+        # 构造 integrity_check 正常、但外键关系损坏的备份
+        bad = Path(self.tmp) / "bad-backup.db"
+        conn = sqlite3.connect(str(bad))
+        try:
+            conn.executescript(
+                "CREATE TABLE sources (id INTEGER PRIMARY KEY);"
+                "CREATE TABLE items (id INTEGER PRIMARY KEY, source_id INTEGER "
+                "REFERENCES sources(id) ON DELETE RESTRICT);"
+                "INSERT INTO items (id, source_id) VALUES (1, 999);")
+            conn.commit()
+            self.assertEqual(conn.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+            self.assertTrue(conn.execute("PRAGMA foreign_key_check").fetchall(),
+                            "构造的备份必须存在外键冲突")
+        finally:
+            conn.close()
+
+        with self.assertRaises(RuntimeError):
+            server.restore_db(bad)
+        self.assertEqual(db_path.read_bytes(), before_bytes,
+                         "恢复失败不得改动原库任何字节")
+        with server.db_conn() as c:
+            self.assertEqual(c.execute("SELECT COUNT(*) FROM items").fetchone()[0], 3)
+            self.assertIsNone(c.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name='sources'").fetchone())
+        self.assertEqual(list(Path(self.tmp).glob("*.restore-tmp")), [])
+        self.assertEqual(list(Path(self.tmp).glob("*.pre-restore")), [])
+
+    def test_backup_failure_leaves_no_partial_file(self):
+        """src.backup() 异常：正式备份不出现残缺文件，也不残留 .tmp。"""
+        db_path = Path(self.tmp) / "pia.db"
+        build_v0_db(str(db_path), rows=1)
+        os.environ["PIA_DB"] = str(db_path)
+        bdir = Path(self.tmp) / "backups"
+        with patch_backup_failure():
+            with self.assertRaises(OSError):
+                server.backup_db()
+        self.assertEqual(list(bdir.glob("*.db")), [], "失败不得产生正式备份文件")
+        self.assertEqual(list(bdir.glob("*.tmp")), [], "失败不得残留临时文件")
+
+    def test_failed_backups_do_not_consume_retention_slots(self):
+        """连续备份失败不清理、也不挤掉已有的有效正式备份。"""
+        db_path = Path(self.tmp) / "pia.db"
+        build_v0_db(str(db_path), rows=1)
+        os.environ["PIA_DB"] = str(db_path)
+        bdir = Path(self.tmp) / "backups"
+        for _ in range(10):
+            self.assertIsNotNone(server.backup_db())
+        valid_names = {f.name for f in bdir.glob("pia.bak.*.db")}
+        self.assertEqual(len(valid_names), 10, "应有 10 份有效正式备份")
+
+        for _ in range(12):
+            with patch_backup_failure():
+                with self.assertRaises(OSError):
+                    server.backup_db()
+        self.assertEqual({f.name for f in bdir.glob("pia.bak.*.db")}, valid_names,
+                         "失败次数增加不得清理或挤掉任何有效备份")
+        self.assertEqual(list(bdir.glob("*.tmp")), [], "失败不得残留临时文件")
 
 
 class ForeignKeyTest(unittest.TestCase):

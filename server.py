@@ -35,6 +35,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 import webbrowser
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -281,64 +282,132 @@ MIGRATIONS.append((1, "add_sources_and_item_columns", migration_v1))
 
 
 def _integrity_ok(conn: sqlite3.Connection) -> bool:
+    """连接版：对已打开的连接做完整性检查（迁移事务内使用）。"""
     row = conn.execute("PRAGMA integrity_check").fetchone()
     return row is not None and row[0] == "ok"
 
 
-def backup_db() -> "Path | None":
-    """迁移前用 SQLite Online Backup API 生成一致的数据库快照。
+def _validate_db_file(path: Path) -> None:
+    """对独立数据库文件做完整性 + 外键关系双重校验，任一不通过即抛错。
 
-    由 SQLite 自身完成备份，可获得一致快照，不依赖当前 journal 模式
-    （DELETE/WAL 均可），也无需手动拼接 .db/-wal/-shm 文件。
-    无库文件则返回 None。
+    integrity_check 只检查页结构，不保证外键关系正确，两项必须分别执行。
+    """
+    conn = sqlite3.connect(str(path), timeout=15)
+    try:
+        integrity = conn.execute("PRAGMA integrity_check").fetchone()
+        if integrity is None or integrity[0] != "ok":
+            raise RuntimeError("数据库完整性校验未通过: %r" % (integrity,))
+        fk = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if fk:
+            raise RuntimeError("数据库存在外键冲突: %r" % (fk,))
+    finally:
+        conn.close()
+
+
+def _unique_backup_name(backup_dir: Path, stem: str, suffix: str) -> Path:
+    """同秒内多次备份也不重名；正式名格式保持不变以兼容保留策略。"""
+    t = datetime.now()
+    while True:
+        dst = backup_dir / f"{stem}.bak.{t.strftime('%Y%m%d-%H%M%S')}{suffix}"
+        if not dst.exists():
+            return dst
+        t += timedelta(seconds=1)
+
+
+def backup_db() -> "Path | None":
+    """迁移前用 SQLite Online Backup API 生成一致快照。
+
+    唯一 .tmp → Online Backup 写入 → 关闭备份连接 → 临时文件做
+    integrity_check 与 foreign_key_check → 全部通过才原子发布为正式备份
+    → 只有正式备份成功后才清理旧备份。任一步失败只清理本次临时文件，
+    绝不触碰已有正式备份，也不会触发清理。无库文件则返回 None。
     """
     p = db_path()
     if not p.exists():
         return None
     backup_dir = p.parent / "backups"
     backup_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    stem, suffix = p.stem, p.suffix  # "pia" + ".db"
-    dst = backup_dir / f"{stem}.bak.{ts}{suffix}"
-    src = sqlite3.connect(str(p), timeout=15)
+    dst = _unique_backup_name(backup_dir, p.stem, p.suffix)
+    tmp = backup_dir / f"{dst.name}.{uuid.uuid4().hex}.tmp"
+    src = None
+    bk = None
     try:
-        bk = sqlite3.connect(str(dst), timeout=15)
-        try:
-            src.backup(bk)
-        finally:
-            bk.close()
-    finally:
+        src = sqlite3.connect(str(p), timeout=15)
+        bk = sqlite3.connect(str(tmp), timeout=15)
+        src.backup(bk)
+        bk.close()
+        bk = None
         src.close()
+        src = None
+        _validate_db_file(tmp)
+        os.replace(tmp, dst)
+        tmp = None
+    finally:
+        for c in (bk, src):
+            if c is not None:
+                try:
+                    c.close()
+                except sqlite3.Error:
+                    pass
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
     _clean_old_backups(backup_dir, keep=10)
     return dst
 
 
 def restore_db(backup_path: Path) -> None:
-    """用经过验证的备份覆盖当前数据库，并清掉可能残留的 -wal/-shm。
+    """从备份恢复当前数据库，全程不留下半恢复状态。
 
-    恢复后重新打开数据库，执行完整性（integrity_check）与外键关系
-    （foreign_key_check）校验，确保恢复出来的是可用、关系一致的数据库，
-    而非空壳或损坏文件。校验失败立即抛错，绝不带坏库启动。
+    前置条件：调用方已关闭所有服务连接。若检测到 -wal/-shm 残留，说明仍有
+    连接未关，直接拒绝恢复而不破坏原库（强删会丢未 checkpoint 的数据）。
+
+    流程：备份 → 唯一临时恢复文件 → 双校验 → 原库另存为回滚副本 →
+    os.replace 原子替换 → 重新打开再校验一次。替换前的任何失败都不动主库；
+    替换后复查失败则自动回滚到恢复前的原库。
     """
     p = db_path()
-    for ext in ("", "-wal", "-shm"):
-        f = p if ext == "" else p.with_name(p.name + ext)
-        if f.exists():
-            f.unlink()
-    shutil.copy2(backup_path, p)
-    conn = sqlite3.connect(str(p), timeout=15)
+    uid = uuid.uuid4().hex
+    tmp = p.with_name(p.name + "." + uid + ".restore-tmp")
+    rollback = p.with_name(p.name + "." + uid + ".pre-restore")
+    replaced = False
     try:
-        integrity = conn.execute("PRAGMA integrity_check").fetchone()
-        if integrity is None or integrity[0] != "ok":
-            raise RuntimeError("恢复后的数据库完整性校验未通过: %r" % (integrity,))
-        fk = conn.execute("PRAGMA foreign_key_check").fetchall()
-        if fk:
-            raise RuntimeError("恢复后的数据库存在外键冲突: %r" % (fk,))
+        shutil.copy2(backup_path, tmp)
+        _validate_db_file(tmp)
+        for ext in ("-wal", "-shm"):
+            if p.with_name(p.name + ext).exists():
+                raise RuntimeError(
+                    "检测到 %s 残留，拒绝恢复以避免把旧日志应用到新库；"
+                    "请先完全停止服务，确认无连接后再重试（必要时先手工备份并移除残留文件）"
+                    % ext)
+        if p.exists():
+            shutil.copy2(p, rollback)
+        os.replace(tmp, p)
+        tmp = None
+        replaced = True
+        _validate_db_file(p)
+    except Exception as exc:
+        if replaced and rollback.exists():
+            try:
+                os.replace(rollback, p)
+                rollback = None
+            except OSError as rerr:
+                raise RuntimeError(
+                    "恢复校验失败且自动回滚失败: %s（原错误: %s）" % (rerr, exc)
+                ) from exc
+        raise
     finally:
-        conn.close()
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
+        if rollback is not None:
+            rollback.unlink(missing_ok=True)
 
 
 def _clean_old_backups(backup_dir: Path, keep: int = 10) -> None:
+    """只统计 backup_db 校验通过后原子发布的正式备份，保留最近 keep 份。
+
+    失败备份写入 .tmp 且从不发布为正式名，因此不会占用保留名额；
+    该函数也只在正式备份成功后才被调用。
+    """
     groups: dict[str, list[Path]] = {}
     for f in backup_dir.glob("pia.bak.*"):
         m = re.match(r"pia\.bak\.(\d{8}-\d{6})\.db(?:-(wal|shm))?$", f.name)
@@ -384,10 +453,16 @@ def ensure_schema() -> None:
                 )
             if not _integrity_ok(conn):
                 raise RuntimeError("迁移后数据库完整性校验未通过")
-    except Exception:
-        # 任何失败：关连接 → 恢复备份 → 重新抛错，绝不带坏 schema 启动
+    except Exception as exc:
+        # db_conn() 的 finally 已关闭连接；迁移失败必须恢复到升级前状态。
+        # 若恢复本身也失败，保留原始迁移异常作为 cause，避免丢失根因。
         if backup_path is not None:
-            restore_db(backup_path)
+            try:
+                restore_db(backup_path)
+            except Exception as rerr:
+                raise RuntimeError(
+                    "迁移失败，且从备份恢复同样失败: %s" % (rerr,)
+                ) from exc
         raise
 
 
@@ -1312,7 +1387,7 @@ def main(argv=None):
     parser.add_argument("--open-browser", action="store_true",
                         help="服务起来后自动打开浏览器（启动脚本用）")
     parser.add_argument("--backup", action="store_true",
-                        help="仅备份数据库（含 -wal/-shm）后退出，不做迁移/启动")
+                        help="用 Online Backup API 生成一致快照（双校验后原子发布）后退出，不做迁移/启动")
     parser.add_argument("--restore", metavar="PATH",
                         help="从指定备份文件恢复数据库后退出，不做迁移/启动")
     parser.add_argument("--migrate-check", action="store_true",

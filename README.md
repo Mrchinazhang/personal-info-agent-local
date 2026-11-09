@@ -142,7 +142,7 @@ Google OAuth 已 retired，OpenAI / ChatGPT / TikTok / GitHub 从未提供；
 - 首次启动自动建库建索引，启用 WAL
 - 语言偏好只存在浏览器 `localStorage`
 - **没有任何遥测、埋点、外链资源、CDN、第三方 API Key**
-- 备份：停掉服务，复制 `data/pia.db`（连同 `-wal` / `-shm`）即可；恢复时覆盖回去
+- 备份 / 恢复：用 `python server.py --backup` 生成快照，用 `python server.py --restore <备份文件>` 恢复；两者内部走 Online Backup API + 完整性/外键双校验 + 原子替换。不要在运行中直接复制 `data/pia.db`（WAL 模式下手工拷贝可能拿到不一致快照）
 - 清空重来：删掉 `data/pia.db`，重启服务
 - **切换成本地版不会自动搬走线上已有的记录**：两版账号体系、数据库完全不同，云端 RLS 下的笔记不会同步过来，也不会被删除。云端版仍可正常登录查看旧数据；需要迁移时，在线上版里手动复制出内容，再从本版的「导入 / 快速记录」录入
 

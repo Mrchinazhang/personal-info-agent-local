@@ -180,15 +180,18 @@ item_provenance（2-C 预留，多对多）# 同一事实的多个候选值 + �
 **迁移框架（核心安全机制）：**
 - `schema_migrations` 表记录已执行版本；`SCHEMA_VERSION=1`，`MIGRATIONS` 列表驱动演化。
 - `SCHEMA` 只保留**基线四表**；所有演化（sources 表、items 新列）只写在迁移里 → **全新库与老库升级后 schema 完全一致**（有测试断言等价）。
-- 启动 `ensure_schema()`：迁移前必 `backup_db()`（**改用 SQLite Online Backup API 生成一致快照**，写出 `data/backups/pia.bak.<时间戳>.db`，保留最近 10 个；不依赖当前 journal 模式，DELETE/WAL 均可）；失败则 `restore_db()` 恢复备份并重新抛错，绝不带坏 schema 启动；`restore_db()` 恢复后重新打开数据库跑 `PRAGMA integrity_check` 与 `PRAGMA foreign_key_check`；迁移后同样跑完整性校验。
+- 启动 `ensure_schema()`：迁移前必 `backup_db()`。唯一 `.tmp` + SQLite Online Backup API 写一致快照 → 关闭备份连接 → 临时文件分别跑 `PRAGMA integrity_check` 与 `PRAGMA foreign_key_check`（integrity 通过不代表外键关系正确，两项必须分别执行）→ 全部通过才 `os.replace()` 原子发布为 `data/backups/pia.bak.<时间戳>.db` → 最后才清理旧备份（只保留最近 10 份**成功生成且通过校验**的正式备份）。任一步失败只清理本次临时文件，不触碰已有正式备份、也不触发清理。
+- 迁移失败则 `restore_db()`：复制成唯一临时恢复文件 → 双校验 → 原库另存为回滚副本 → `os.replace()` 原子替换 → 重新打开再校验一次。替换前失败绝不动主库；替换后复查失败自动回滚；检测到 `-wal`/`-shm` 残留直接拒绝恢复（说明仍有连接未关，强删会丢未 checkpoint 的数据）。迁移异常与恢复异常均可追踪（恢复失败作为 cause 链的附加信息）。迁移后同样跑完整性校验。
 - 手动运维：`python server.py --backup` / `--restore <路径>` / `--migrate-check`。
 - 旧数据迁移：种子 `sources(id=1, kind='legacy')`，并把所有旧 `items` 回填 `source_id=1, state=confirmed, confidence=1.0`（旧数据均属用户手动录入，视为已确认、全可信）。
 
 **写时约束**：`/api/db` 对 items 的 `state`/`confidence` 做轻量校验（枚举 + 0–1 区间）；`source_id`/`state`/`confidence` 写缺省为 `NULL`/`confirmed`/`1.0`。**来源在写时的强制选择留到 2-B/2-C**（那时前端才有来源选择 UI），2-A 只建机制与列。
 
-**2-A 已改文件**：`server.py`（数据模型 + 迁移框架 + 校验 + CLI）、`tests/test_server.py`（迁移/来源测试）、`tests/local.test.js`（删字节级比对，改接口契约 + 行为测试）、本文件。
+**2-A 已改文件**：`server.py`（数据模型 + 迁移框架 + 校验 + CLI）、`tests/test_server.py`（迁移/来源测试）、`tests/local.test.js`（删字节级比对，改接口契约 + 行为测试）、本文件。**2-A 未修改前端运行时代码**（`app.js` / `index.html` / `styles.css` / `i18n.js` / `i18n-dict.js` / `config.js` / `local-cloud.js` 均未改动），仅修改了前端契约测试 `tests/local.test.js`。
 
 **2-A 数据库安全增强（封版前补充 ✅）**：应终审要求，在推送前补强两点——① `items.source_id` 增加 `REFERENCES sources(id) ON DELETE RESTRICT` 外键（无效来源被 DB 拒绝、NULL 仍允许、删除被引用来源受限）；② 备份由 `shutil.copy2` 文件拼接改为 `sqlite3` Online Backup API（一致快照，不绑定 DELETE 日志模式），恢复新增 `integrity_check` + `foreign_key_check`。新增 `ForeignKeyTest`（5 项）与 `test_restore_db_recovers_database_from_backup`（备份→迁移→人为损坏→恢复→结构与数据核验），并修正 `SourceAndStateTest` 删除后重新种入 legacy 来源 `id=1`。
+
+**2-A 安全修复（第 6 个 commit，代码级复核后补充）**：针对复核发现的 2 个阻断缺陷，补强备份与恢复的原子性——① `backup_db()` 改为「临时文件 → 双校验 → 原子发布」，异常不留残缺正式备份、不占保留名额；② `restore_db()` 改为「先验临时恢复文件 → 回滚副本 → 原子替换 → 替换后复查」，校验失败原库零改动、无半恢复状态；③ `schema_signature()` 覆盖字段属性、索引唯一性/字段顺序/索引 SQL、外键目标与删除行为，并新增「旧结构原有对象逐项保留」断言（不要求 v0 与 v1 整体相等）；④ `ensure_schema()` 恢复失败时保留原始迁移异常。新增 5 项故障安全测试，后端测试全绿。
 
 ### 2-A 边界说明
 - 不在 2-A 碰 `app.js` / `local-cloud.js` 业务职责，符合「不做无必要大规模重构」。
